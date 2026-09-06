@@ -26,16 +26,17 @@ class exit_hit:
     is_hit: bool = False
 
     def to_row(self):
-        return [self.future_price, self.option_price, self.timestamp]
+        return [self.timestamp, self.option_price]
 
 
 @dataclass
 class eod_exit:
     future_price: float = 0.0
     option_price: float = 0.0
+    timestamp: str = ""
 
     def to_row(self):
-        return [self.future_price, self.option_price]
+        return [self.timestamp, self.option_price]
 
 
 @dataclass
@@ -62,7 +63,7 @@ class paper_trade_row:
     # Standard exits
     exit1_hit: exit_hit = field(default_factory=exit_hit)  # Length Of Piercing
     exit2_hit: exit_hit = field(default_factory=exit_hit)  # 2 x Length Of Piercing
-    exit3_hit: exit_hit = field(default_factory=exit_hit)  # 8 Points
+    exit3_hit: exit_hit = field(default_factory=exit_hit)  # 7 Points
     # Exit-4 (Bollinger target) -- kept for the engine's hypothesis tracking
     exit4_hit: exit_hit = field(default_factory=exit_hit)
 
@@ -94,16 +95,14 @@ class paper_trade_row:
         row += self.confirm_candle.to_row()
 
         # Entry and SL
-        row += [self.entry_timestamp]
-        row += [self.sl_low]
+        row += [self.entry_timestamp, self.entry_future_price]
+        row += self.sl_hit.to_row()
 
         # Standard exit hits (each returns [future_price, option_price, timestamp])
         row += self.exit1_hit.to_row()
         row += self.exit2_hit.to_row()
-        row += self.exit3_hit.to_row()
-
-        # Bollinger / Exit-4 hypothesis
-        row += self.exit4_hit.to_row()
+        row += [self.exit3_hit.timestamp,
+            self.entry_option_price + 7.0 if self.exit3_hit.is_hit else 0.0]
 
         # Fixed-point exits
         row += self.exit4_10_hit.to_row()

@@ -25,14 +25,6 @@ PIERCING_CUTOFF_TIME = "14:00:00"
 # above -- it only ever applies to a trade that has actually entered (IN_TRADE).
 FORCE_EXIT_TIME = "14:50:00"
 
-# A piercing candle only counts if its Close has moved at least this far past VWAP -- filters out
-# marginal pierces that are really just noise around the VWAP line.
-PIERCING_MIN_VWAP_GAP = 6
-
-# ...and the candle's Open must already be at least this far from VWAP on the piercing side, so
-# the candle is genuinely piercing through rather than opening right on top of VWAP.
-PIERCING_MIN_OPEN_VWAP_GAP = 5
-
 # During SEEK_CONFIRM_ENTRY, entry only fires once price has cleared back through VWAP by at
 # least this much -- a bare crossing right on the VWAP line is treated as noise, not a real entry.
 ENTRY_MIN_VWAP_GAP = 5
@@ -71,14 +63,12 @@ def time_of_day(date_time_str):
 
 def piercing_direction(row):
     """
-    Returns 'BUY', 'SELL', or None for a candle row (needs OPEN/CLOSE/VWAP). Only counts as a
-    piercing if the Open starts at least PIERCING_MIN_OPEN_VWAP_GAP away from VWAP on the piercing
-    side, and the Close has cleared VWAP on the other side by at least PIERCING_MIN_VWAP_GAP --
-    a marginal open or close right on the VWAP line is treated as noise, not a real piercing.
+    Returns 'BUY', 'SELL', or None for a candle row (needs OPEN/CLOSE/VWAP). A piercing is a
+    candle whose open and close are on opposite sides of VWAP.
     """
-    if row[OPEN_PRICE] < row[VWAP] - PIERCING_MIN_OPEN_VWAP_GAP and row[CLOSE_PRICE] > row[VWAP] + PIERCING_MIN_VWAP_GAP:
+    if row[OPEN_PRICE] < row[VWAP] and row[CLOSE_PRICE] > row[VWAP]:
         return "BUY"
-    if row[OPEN_PRICE] > row[VWAP] + PIERCING_MIN_OPEN_VWAP_GAP and row[CLOSE_PRICE] < row[VWAP] - PIERCING_MIN_VWAP_GAP:
+    if row[OPEN_PRICE] > row[VWAP] and row[CLOSE_PRICE] < row[VWAP]:
         return "SELL"
     return None
 

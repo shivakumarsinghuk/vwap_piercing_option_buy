@@ -23,7 +23,7 @@ class UserInterfaceConfig(IUserInterface):
     def __init__(self, key):
         self.data = ConfigData()
         self.googlesheet_utility = gsheet_utility(account_file=key,
-                                                  spread_sheet_name="VWAPPiercingOptions")
+                                                  spread_sheet_name="VWAP_Piercing_Options_Buy")
         self.gworksheet_config_data = self.googlesheet_utility.get_work_sheet("Config")
         self.__set_data()
 

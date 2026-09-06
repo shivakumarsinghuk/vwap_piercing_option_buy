@@ -38,10 +38,10 @@ from datetime import datetime, timedelta
 
 import pandas_market_calendars as mcal
 
-from BusinessLogic.vwappiercing_options.UserInterface.gsheet.login.login import UserInterfaceLogin
-from BusinessLogic.vwappiercing_options.UserInterface.gsheet.config.config import UserInterfaceConfig
-from BusinessLogic.vwappiercing_options.UserInterface.gsheet.backtest.backtest import UserInterfaceBackTest
-from BusinessLogic.vwappiercing_options.Logic.backtest_engine import run_backtest_for_day, describe_exit_outcomes, STATUS_NO_DATA
+from BusinessLogic.vwap_piercing_option_buy.UserInterface.gsheet.login.login import UserInterfaceLogin
+from BusinessLogic.vwap_piercing_option_buy.UserInterface.gsheet.config.config import UserInterfaceConfig
+from BusinessLogic.vwap_piercing_option_buy.UserInterface.gsheet.backtest.backtest import UserInterfaceBackTest
+from BusinessLogic.vwap_piercing_option_buy.Logic.backtest_engine import run_backtest_for_day, describe_exit_outcomes, STATUS_NO_DATA
 from BrokerUtility.broker_platform.zebu.zebumynt_utility import zebumynt_utitlity
 from BrokerUtility.pal.utility_manager import *
 
