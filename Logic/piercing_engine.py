@@ -58,6 +58,7 @@ STATUS_NO_DATA = "no_data"
 STATUS_OK = "ok"
 
 DAY_START_TIME = "09:15:00"
+BACKTEST_PIERCING_START_TIME = "09:35:00"
 BOLLINGER_PERIOD = 20
 BOLLINGER_STD_DEV = 2
 
@@ -93,6 +94,11 @@ class _DirectionState:
         self.exit1_level = 0.0
         self.exit2_level = 0.0
         self.exit3_level = 0.0
+        self.exit4_10_level = 0.0
+        self.exit4_15_level = 0.0
+        self.exit4_20_level = 0.0
+        self.exit4_30_level = 0.0
+        self.exit4_40_level = 0.0
         self.mae = 0.0
         self.mfe = 0.0
         self.mae_time = ""
@@ -193,7 +199,7 @@ class VwapPiercingEngine(ILogic):
         self.trade_date_str = trade_date_str
         self.candle_interval_minutes = candle_interval_minutes
         self.log_fn = log_fn or (lambda msg: None)
-        self.piercing_start_time = pattern_rules.compute_piercing_start_time(DAY_START_TIME)
+        self.piercing_start_time = BACKTEST_PIERCING_START_TIME
         self.results = []
 
     def get_broker_utility(self):
@@ -422,6 +428,16 @@ class VwapPiercingEngine(ILogic):
         self.__mark_exit_if_hit_point(ds, ds.current_trade.exit1_hit, ds.exit1_level, option_ltp, now_str)
         self.__mark_exit_if_hit_point(ds, ds.current_trade.exit2_hit, ds.exit2_level, option_ltp, now_str)
         self.__mark_exit3_if_hit_point(ds, option_ltp, now_str)
+        self.__mark_exit_if_hit_point(ds, ds.current_trade.exit4_10_hit, ds.exit4_10_level, option_ltp, now_str,
+                          record_target_price=True)
+        self.__mark_exit_if_hit_point(ds, ds.current_trade.exit4_15_hit, ds.exit4_15_level, option_ltp, now_str,
+                          record_target_price=True)
+        self.__mark_exit_if_hit_point(ds, ds.current_trade.exit4_20_hit, ds.exit4_20_level, option_ltp, now_str,
+                          record_target_price=True)
+        self.__mark_exit_if_hit_point(ds, ds.current_trade.exit4_30_hit, ds.exit4_30_level, option_ltp, now_str,
+                          record_target_price=True)
+        self.__mark_exit_if_hit_point(ds, ds.current_trade.exit4_40_hit, ds.exit4_40_level, option_ltp, now_str,
+                          record_target_price=True)
 
         self.__log_exit_breaches(ds, was_hit)
 
@@ -437,7 +453,8 @@ class VwapPiercingEngine(ILogic):
             self.__stamp_mae_mfe(ds)
             self.__finalize_and_reset_live(ds, "SL")
 
-    def __mark_exit_if_hit_point(self, ds: _DirectionState, exit_hit_obj: exit_hit, level, option_ltp, now_str, is_stop=False):
+    def __mark_exit_if_hit_point(self, ds: _DirectionState, exit_hit_obj: exit_hit, level, option_ltp, now_str,
+                                 is_stop=False, record_target_price=False):
         # LIVE checks a single LTP point against the level (tick-driven; no High/Low range).
         if exit_hit_obj.is_hit or level == 0.0:
             return
@@ -447,7 +464,7 @@ class VwapPiercingEngine(ILogic):
             hit = option_ltp >= level
         if hit:
             exit_hit_obj.future_price = ds.current_trade.entry_future_price
-            exit_hit_obj.option_price = option_ltp
+            exit_hit_obj.option_price = level if record_target_price else option_ltp
             exit_hit_obj.timestamp = now_str
             exit_hit_obj.is_hit = True
 
@@ -457,7 +474,7 @@ class VwapPiercingEngine(ILogic):
             return
         if option_ltp >= ds.exit3_level:
             exit_hit_obj.future_price = ds.current_trade.entry_future_price
-            exit_hit_obj.option_price = ds.exit3_level
+            exit_hit_obj.option_price = ds.current_trade.entry_option_price + 7.0
             exit_hit_obj.timestamp = now_str
             exit_hit_obj.is_hit = True
 
@@ -768,6 +785,16 @@ class VwapPiercingEngine(ILogic):
             self.__mark_exit_if_hit_range(ds, trade.exit2_hit, ds.exit2_level, row, ds.direction, ts,
                                           option_price=option_price)
             self.__mark_exit3_if_hit_candle(ds, row, ts, option_price)
+            self.__mark_exit_if_hit_range(ds, trade.exit4_10_hit, ds.exit4_10_level, row, ds.direction, ts,
+                                          option_price=option_price, record_target_price=True)
+            self.__mark_exit_if_hit_range(ds, trade.exit4_15_hit, ds.exit4_15_level, row, ds.direction, ts,
+                                          option_price=option_price, record_target_price=True)
+            self.__mark_exit_if_hit_range(ds, trade.exit4_20_hit, ds.exit4_20_level, row, ds.direction, ts,
+                                          option_price=option_price, record_target_price=True)
+            self.__mark_exit_if_hit_range(ds, trade.exit4_30_hit, ds.exit4_30_level, row, ds.direction, ts,
+                                          option_price=option_price, record_target_price=True)
+            self.__mark_exit_if_hit_range(ds, trade.exit4_40_hit, ds.exit4_40_level, row, ds.direction, ts,
+                                          option_price=option_price, record_target_price=True)
 
         # Exit-4 target: Bollinger upper band for BUY, lower band for SELL -- price reaching
         # the band in the trade's favor, same target-style semantics as Exit-1..3 -- but it's a
@@ -945,6 +972,11 @@ class VwapPiercingEngine(ILogic):
         ds.exit1_level = option_entry_price + piercing_length
         ds.exit2_level = option_entry_price + (2 * piercing_length)
         ds.exit3_level = option_entry_price + 7.0
+        ds.exit4_10_level = option_entry_price + 10.0
+        ds.exit4_15_level = option_entry_price + 15.0
+        ds.exit4_20_level = option_entry_price + 20.0
+        ds.exit4_30_level = option_entry_price + 30.0
+        ds.exit4_40_level = option_entry_price + 40.0
 
         ds.current_trade = trade
         ds.option_symbol = option_symbol
@@ -1002,7 +1034,7 @@ class VwapPiercingEngine(ILogic):
         # when/whether they fired.
         return {
             "Exit1 (Length of Piercing)": trade.exit1_hit.is_hit,
-            "Exit2 (0.2%)": trade.exit2_hit.is_hit,
+            "Exit2 (2 x Length of Piercing)": trade.exit2_hit.is_hit,
             "Exit3 (7 Points)": trade.exit3_hit.is_hit,
             "Exit4 (Bollinger)": trade.exit4_hit.is_hit,
         }
@@ -1013,7 +1045,7 @@ class VwapPiercingEngine(ILogic):
     def __log_exit_breaches(self, ds: _DirectionState, was_hit):
         trade = ds.current_trade
         for label, hit_obj in (("Exit1 (Length of Piercing)", trade.exit1_hit),
-                               ("Exit2 (0.2%)", trade.exit2_hit),
+                               ("Exit2 (2 x Length of Piercing)", trade.exit2_hit),
                                ("Exit3 (7 Points)", trade.exit3_hit),
                                ("Exit4 (Bollinger)", trade.exit4_hit)):
             if was_hit[label] or not hit_obj.is_hit:
@@ -1027,7 +1059,7 @@ class VwapPiercingEngine(ILogic):
                           f"(hypothesis only -- trade continues, only SL closes it)")
 
     def __mark_exit_if_hit_range(self, ds: _DirectionState, exit_hit_obj: exit_hit, level, row, direction, ts,
-                                 option_price=None, is_stop=False):
+                                 option_price=None, is_stop=False, record_target_price=False):
         # Historical option data is sampled at the closest 1-minute close; no future candle
         # value participates in deciding whether an option exit is hit.
         if exit_hit_obj.is_hit:
@@ -1040,7 +1072,7 @@ class VwapPiercingEngine(ILogic):
             hit = option_price >= level
         if hit:
             exit_hit_obj.future_price = ds.current_trade.entry_future_price
-            exit_hit_obj.option_price = option_price
+            exit_hit_obj.option_price = level if record_target_price else option_price
             exit_hit_obj.timestamp = ts
             exit_hit_obj.is_hit = True
 
@@ -1051,7 +1083,7 @@ class VwapPiercingEngine(ILogic):
             return
         if float(row[HIGH_PRICE]) >= ds.exit3_level:
             exit_hit_obj.future_price = ds.current_trade.entry_future_price
-            exit_hit_obj.option_price = ds.exit3_level
+            exit_hit_obj.option_price = ds.current_trade.entry_option_price + 7.0
             exit_hit_obj.timestamp = ts
             exit_hit_obj.is_hit = True
 

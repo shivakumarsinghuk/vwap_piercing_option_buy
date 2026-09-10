@@ -95,7 +95,7 @@ class paper_trade_row:
         row += self.confirm_candle.to_row()
 
         # Entry and SL
-        row += [self.entry_timestamp, self.entry_future_price]
+        row += [self.entry_timestamp, self.entry_option_price]
         row += self.sl_hit.to_row()
 
         # Standard exit hits (each returns [future_price, option_price, timestamp])

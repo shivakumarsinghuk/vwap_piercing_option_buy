@@ -32,7 +32,7 @@ HEADER_ROWS = [
         "Time Stamp", "O", "H", "L", "C", "VWAP",
         "Time Stamp", "O", "H", "L", "C", "VWAP",
         "Time Stamp", "O", "H", "L", "C", "VWAP",
-        "Time Stamp", "Entry Price",
+        "Time Stamp", "Option Entry Price",
         "Time Stamp", "Option Price",
         "Time Stamp", "Option Price",
         "Time Stamp", "Option Price",
