@@ -80,7 +80,7 @@ class _DirectionState:
         self.state = STATE_SEEK_PIERCING
         self.piercing_candle = None
         self.reclaim_candle = None
-        # 1-min reclaim candles carry no VWAP of their own -- the main-interval VWAP they were
+        # 5-min reclaim candles carry no VWAP of their own -- the main-interval VWAP they were
         # checked against is tracked separately here.
         self.reclaim_vwap = 0.0
         # LIVE only: ticks are polled every few seconds, but the periodic waiting-for-entry/
@@ -183,7 +183,7 @@ class VwapPiercingEngine(ILogic):
         self.piercing_start_time = pattern_rules.compute_piercing_start_time(self.execution_start_time)
 
         self.processed_candle_count = 0
-        self.processed_candle_count_1min = 0
+        self.processed_candle_count_5min = 0
 
         self.pre_requisite_thread = threading.Thread(target=self.pre_requisite_thread_handler)
         self.execute_thread = threading.Thread(target=self.execute)
@@ -329,24 +329,22 @@ class VwapPiercingEngine(ILogic):
 
             self.processed_candle_count = len(candle_data)
 
-        # Reclaim is checked against 1-min candles (finer granularity than
-        # candle_interval_minutes) so a reclaim isn't missed/delayed by waiting for the next full
-        # main-interval candle to close -- but still measured against the main interval's own
-        # VWAP (self.last_candle_data), not a separate 1-min VWAP.
-        candle_data_1min = broker.fetchOHLC(signal_symbol, str_from_date, str_to_date,
-                            interval="1minute", all_data=True,
+        # Reclaim is checked against 5-min candles while still measured against the main
+        # interval's own VWAP (self.last_candle_data), not a separate 5-min VWAP.
+        candle_data_5min = broker.fetchOHLC(signal_symbol, str_from_date, str_to_date,
+                            interval="5minute", all_data=True,
                             market_type=self.__option_market_type())
-        if candle_data_1min is not None and len(candle_data_1min) > 0:
-            new_rows_1min = candle_data_1min.iloc[self.processed_candle_count_1min:]
-            for _, row in new_rows_1min.iterrows():
+        if candle_data_5min is not None and len(candle_data_5min) > 0:
+            new_rows_5min = candle_data_5min.iloc[self.processed_candle_count_5min:]
+            for _, row in new_rows_5min.iterrows():
                 for ds in self.directions.values():
                     if ds.state == STATE_SEEK_RECLAIM:
-                        self.__on_reclaim_1min_close_live(ds, row)
+                        self.__on_reclaim_5min_close_live(ds, row)
 
-            self.processed_candle_count_1min = len(candle_data_1min)
+            self.processed_candle_count_5min = len(candle_data_5min)
 
-    def __on_reclaim_1min_close_live(self, ds: _DirectionState, row):
-        # row is a 1-min candle; vwap is looked up from the main-interval series so reclaim is
+    def __on_reclaim_5min_close_live(self, ds: _DirectionState, row):
+        # row is a 5-min candle; vwap is looked up from the main-interval series so reclaim is
         # still measured against the same VWAP the rest of the pattern uses.
         current_vwap = self.__get_latest_vwap()
         if current_vwap is None:
@@ -354,7 +352,7 @@ class VwapPiercingEngine(ILogic):
         ts = str(row[DATE_TIME])
         if self.__check_reclaim(ds, row, current_vwap, ts):
             return
-        # Not reclaimed yet -- keep waiting on subsequent 1-min candles rather than abandoning
+        # Not reclaimed yet -- keep waiting on subsequent 5-min candles rather than abandoning
         # after just one miss. The piercing candle stays the reference point.
         print(self.logic_name, f": [{ts}] ({ds.direction}) no reclaim yet, still waiting {self.__fmt_candle(row, current_vwap)}")
 
@@ -373,6 +371,9 @@ class VwapPiercingEngine(ILogic):
             return
         piercing_high = float(ds.piercing_candle[HIGH_PRICE])
         piercing_low = float(ds.piercing_candle[LOW_PRICE])
+        if not self.__has_acceptable_top_wick(self.last_candle_data.iloc[-1]):
+            self.__log_once_per_candle(ds, f": [{now_str}] ({ds.direction}) waiting for entry: confirmation candle top wick exceeds body")
+            return
         if ds.direction == "BUY":
             triggered = ltp >= piercing_high
         else:
@@ -641,16 +642,14 @@ class VwapPiercingEngine(ILogic):
         candle_data[VWAP] = [compute_vwap(candle_data, last_loc=i + 1) for i in range(len(candle_data))]
         self.last_candle_data = candle_data
 
-        # Reclaim is checked against 1-min candles (finer granularity than
-        # candle_interval_minutes) so a reclaim isn't missed/delayed by waiting for the next full
-        # main-interval candle to close -- but still measured against the main interval's own
-        # VWAP, not a separate 1-min VWAP. Falls back to the main-interval series (old
-        # per-main-candle behavior) if 1-min data isn't available.
-        candle_data_1min = broker.fetchOHLC(signal_option_symbol, str_from_date, str_to_date,
-                            interval="1minute", all_data=True,
+        # Reclaim is checked against 5-min candles while still measured against the main
+        # interval's own VWAP, not a separate 5-min VWAP. Falls back to the main-interval
+        # series if 5-min data isn't available.
+        candle_data_5min = broker.fetchOHLC(signal_option_symbol, str_from_date, str_to_date,
+                            interval="5minute", all_data=True,
                             market_type=self.__option_market_type())
-        if candle_data_1min is None or len(candle_data_1min) == 0:
-            candle_data_1min = candle_data
+        if candle_data_5min is None or len(candle_data_5min) == 0:
+            candle_data_5min = candle_data
 
         # Bollinger bands are rolling (causal, only look back), so precomputing over the whole day
         # upfront and indexing by row is equivalent to recomputing fresh at each candle -- no
@@ -658,20 +657,19 @@ class VwapPiercingEngine(ILogic):
         self.upper_band, self.middle_band, self.lower_band = compute_bollinger_bands(
             candle_data, period=self.bollinger_period, std_dev=self.bollinger_std_dev)
 
-        one_min_idx = 0
+        five_min_idx = 0
 
         for i in range(len(candle_data)):
             row = candle_data.iloc[i]
             ts = str(row[DATE_TIME])
             self._backtest_row_index = i
 
-            # 1-min candles closing within this main-interval candle's window, consumed in
-            # order -- used for the reclaim check below at finer granularity than
-            # candle_interval_minutes.
+            # 5-min candles closing within this main-interval candle's window, consumed in order
+            # for the reclaim and confirmation checks.
             sub_rows = []
-            while one_min_idx < len(candle_data_1min) and str(candle_data_1min.iloc[one_min_idx][DATE_TIME]) <= ts:
-                sub_rows.append(candle_data_1min.iloc[one_min_idx])
-                one_min_idx += 1
+            while five_min_idx < len(candle_data_5min) and str(candle_data_5min.iloc[five_min_idx][DATE_TIME]) <= ts:
+                sub_rows.append(candle_data_5min.iloc[five_min_idx])
+                five_min_idx += 1
 
             for direction, ds in self.directions.items():
                 if ds.state in (STATE_SEEK_RECLAIM, STATE_SEEK_CONFIRM_ENTRY) \
@@ -730,6 +728,8 @@ class VwapPiercingEngine(ILogic):
         trigger_price = None
         if sub_rows:
             for r in sub_rows:
+                if not self.__has_acceptable_top_wick(r):
+                    continue
                 if ds.direction == "BUY" and float(r[HIGH_PRICE]) >= piercing_high:
                     triggered = True
                     trigger_price = float(r[CLOSE_PRICE])
@@ -739,10 +739,10 @@ class VwapPiercingEngine(ILogic):
                     trigger_price = float(r[CLOSE_PRICE])
                     break
         else:
-            if ds.direction == "BUY" and float(row[HIGH_PRICE]) >= piercing_high:
+            if self.__has_acceptable_top_wick(row) and ds.direction == "BUY" and float(row[HIGH_PRICE]) >= piercing_high:
                 triggered = True
                 trigger_price = float(row[CLOSE_PRICE])
-            if ds.direction == "SELL" and float(row[LOW_PRICE]) <= piercing_low:
+            if self.__has_acceptable_top_wick(row) and ds.direction == "SELL" and float(row[LOW_PRICE]) <= piercing_low:
                 triggered = True
                 trigger_price = float(row[CLOSE_PRICE])
 
@@ -752,6 +752,11 @@ class VwapPiercingEngine(ILogic):
 
         entry_price = trigger_price if trigger_price is not None else (float(sub_rows[-1][CLOSE_PRICE]) if sub_rows else float(row[CLOSE_PRICE]))
         self.__enter_trade(ds, entry_price, ts, main_row=row)
+
+    def __has_acceptable_top_wick(self, row):
+        body = abs(float(row[CLOSE_PRICE]) - float(row[OPEN_PRICE]))
+        top_wick = float(row[HIGH_PRICE]) - max(float(row[OPEN_PRICE]), float(row[CLOSE_PRICE]))
+        return top_wick <= body
 
     def __check_in_trade_backtest(self, ds: _DirectionState, row, ts):
         trade = ds.current_trade
@@ -1088,7 +1093,7 @@ class VwapPiercingEngine(ILogic):
             exit_hit_obj.is_hit = True
 
     def __to_snapshot(self, row, vwap=None):
-        # vwap is an explicit override for 1-min reclaim rows, which carry no VWAP of their own
+        # vwap is an explicit override for 5-min reclaim rows, which carry no VWAP of their own
         # -- they're measured against the main-interval candle's VWAP instead.
         v = row[VWAP] if vwap is None else vwap
         return candle_snapshot(timestamp=str(row[DATE_TIME]), open=float(row[OPEN_PRICE]),
