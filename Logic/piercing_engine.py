@@ -130,7 +130,7 @@ class VwapPiercingEngine(ILogic):
         self.mode = mode
         self.option_type = option_type
         self.trade_direction = "BUY"
-        self.logic_name = "LogicVwapPiercingOptions"
+        self.logic_name = "LogicVwapPiercingOptionsBuy"
 
         # strategy constants
         self.index_name = "NIFTY"
@@ -159,6 +159,8 @@ class VwapPiercingEngine(ILogic):
     # mode-specific setup
     # ------------------------------------------------------------------
     def __init_live(self, args, broker_utility_manager: utility_manager, quotes_utility: QuoteUtility):
+
+        print("Starting Live Mode of Logic: ", self.logic_name)
         self.obj_utility_manager = broker_utility_manager
         self.obj_ui_adapter_login: UserInterfaceAdapterLogin = UserInterfaceAdapterLogin(args)
         self.obj_ui_adapter_config: UserInterfaceAdapterConfig = UserInterfaceAdapterConfig(args)

@@ -17,7 +17,7 @@ class LogicVwapPiercingOptionsInterface(ILogicInterface):
 
     def create(self, args, broker_utility_manager:utility_manager, quotes_utility:QuoteUtility):
         print("Creating VWAP Piercing Options Logic Object")
-        self.obj_logic: LogicVwapPiercingOptions = LogicVwapPiercingOptions(args, broker_utility_manager, quotes_utility)
+        self.obj_logic: LogicVwapPiercingOptionsBuy = LogicVwapPiercingOptionsBuy(args, broker_utility_manager, quotes_utility)
 
     def wait_for_completion(self):
         print("Wait For Completion", self.obj_logic.__class__.__name__)

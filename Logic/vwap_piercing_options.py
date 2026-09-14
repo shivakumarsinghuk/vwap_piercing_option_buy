@@ -17,7 +17,7 @@ completed trade logged to the PaperTradeData sheet.
 from .piercing_engine import VwapPiercingEngine, Mode
 
 
-class LogicVwapPiercingOptions(VwapPiercingEngine):
+class LogicVwapPiercingOptionsBuy(VwapPiercingEngine):
 
     def __init__(self, args, broker_utility_manager, quotes_utility):
         super().__init__(mode=Mode.LIVE, args=args, broker_utility_manager=broker_utility_manager,
