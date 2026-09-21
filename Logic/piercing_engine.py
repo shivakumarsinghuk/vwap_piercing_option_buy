@@ -507,6 +507,7 @@ class VwapPiercingEngine(ILogic):
         self.__finalize_and_reset_live(ds, reason)
 
     def __finalize_and_reset_live(self, ds: _DirectionState, reason="EOD"):
+        print(self.logic_name, f": FINALIZING LIVE TRADE reason={reason} direction={ds.direction} option={ds.option_symbol} entry={ds.current_trade.entry_future_price} ts={ds.current_trade.entry_timestamp}")
         self.obj_paper_trade_writer.write_trade(ds.current_trade, self.candle_interval_minutes,
                                                 describe_exit_outcomes(ds.current_trade))
         close_option_price = ds.current_trade.sl_hit.option_price if reason == "SL" \
@@ -998,7 +999,8 @@ class VwapPiercingEngine(ILogic):
             # reset the once-per-candle throttle on entry so the first in-trade status line isn't
             # suppressed by the candle timestamp already logged during the waiting-for-entry phase.
             ds.last_logged_candle_ts = None
-            print(self.logic_name, ": Entered paper trade", ds.direction, option_symbol, "@", option_price)
+            print(self.logic_name, ": LIVE ENTRY", ds.direction, option_symbol, "@", option_price,
+                  "future_entry=", entry_future_price, "ts=", ts)
         else:
             # Exit-4 (Bollinger) isn't fixed at entry like SL/Exit-1..3 -- it moves every candle
             # (checked in __check_in_trade_backtest below). Shown here is just its value at the

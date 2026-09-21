@@ -66,6 +66,10 @@ def piercing_direction(row):
     Returns 'BUY', 'SELL', or None for a candle row (needs OPEN/CLOSE/VWAP). A piercing is a
     candle whose open and close are on opposite sides of VWAP.
     """
+    body = abs(float(row[CLOSE_PRICE]) - float(row[OPEN_PRICE]))
+    top_wick = float(row[HIGH_PRICE]) - max(float(row[OPEN_PRICE]), float(row[CLOSE_PRICE]))
+    if body <= top_wick:
+        return None
     if row[OPEN_PRICE] < row[VWAP] and row[CLOSE_PRICE] > row[VWAP]:
         return "BUY"
     if row[OPEN_PRICE] > row[VWAP] and row[CLOSE_PRICE] < row[VWAP]:

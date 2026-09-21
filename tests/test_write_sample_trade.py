@@ -1,4 +1,4 @@
-# Run: python -m BusinessLogic.vwappiercing_options.tests.test_write_sample_trade --key <path_to_service_account_json>
+# Run: python -m BusinessLogic.vwap_piercing_option_buy.tests.test_write_sample_trade --key <path_to_service_account_json>
 # -*- coding: utf-8 -*-
 """
 test_write_sample_trade.py
@@ -6,14 +6,14 @@ test_write_sample_trade.py
 Standalone smoke test for the PaperTradeData gsheet write path. Bypasses the
 broker login and candle/state-machine engine entirely -- useful for testing
 on a day the market is closed. Writes one fake row to the PaperTradeData
-worksheet of the "VWAPPiercingOptions" Google Sheet.
+worksheet of the "VWAP_Piercing_Options_Buy" Google Sheet.
 """
 import argparse
 from datetime import date, datetime
 
-from BusinessLogic.vwappiercing_options.UserInterface.gsheet.paper_trade.paper_trade import UserInterfacePaperTrade
-from BusinessLogic.vwappiercing_options.DataTypes.paper_trade_data import paper_trade_row, candle_snapshot, exit_hit, eod_exit
-from BusinessLogic.vwappiercing_options.Logic.backtest_engine import describe_exit_outcomes
+from BusinessLogic.vwap_piercing_option_buy.UserInterface.gsheet.paper_trade.paper_trade import UserInterfacePaperTrade
+from BusinessLogic.vwap_piercing_option_buy.DataTypes.paper_trade_data import paper_trade_row, candle_snapshot, exit_hit, eod_exit
+from BusinessLogic.vwap_piercing_option_buy.Logic.backtest_engine import describe_exit_outcomes
 
 
 def build_sample_row():
@@ -57,4 +57,4 @@ if __name__ == "__main__":
     writer = UserInterfacePaperTrade(args.key)
     sample_row = build_sample_row()
     writer.write_trade(sample_row, 15, describe_exit_outcomes(sample_row))
-    print("Done. Check the PaperTradeData tab in the VWAPPiercingOptions Google Sheet for the new row.")
+    print("Done. Check the PaperTradeData tab in the VWAP_Piercing_Options_Buy Google Sheet for the new row.")

@@ -38,10 +38,26 @@ class UserInterfacePaperTrade:
             # append_table()'s "find the last table and append after it" heuristic drifts further
             # right on every call once any row's data doesn't start at column A (confirmed in
             # practice -- each botched write becomes the next call's "table", compounding the
-            # drift run after run). Find the next empty row from column A's own populated count
-            # instead, and write there explicitly, so every row always starts at column A.
-            next_row = len(self.gworksheet_paper_trade.get_col(1, include_tailing_empty=False)) + 1
+            # drift run after run). Find the next empty row explicitly instead, so every row
+            # always starts at column A.
+            #
+            # Scan whole rows, not just column A: HEADER_ROWS' second row is blank in column A
+            # (it holds the per-candle "Time Stamp/O/H/L/C/VWAP" sub-labels starting at column D),
+            # so a column-A count sees only 1 populated row and sends the first trade of the run
+            # to row 2 -- on top of that sub-header. __ensure_header() then rewrites rows 1-2 on
+            # the next startup, wiping that trade, which is exactly why live runs left this sheet
+            # looking empty while BackTestData (which floors its first data row at 3) kept its
+            # rows. Floor at row 3 for the same reason.
+            rows = self.gworksheet_paper_trade.get_all_values()
+            last_populated_row = max(
+                (row_number for row_number, row in enumerate(rows, start=1)
+                 if any(str(cell).strip() for cell in row)),
+                default=0,
+            )
+            next_row = max(last_populated_row + 1, 3)
             self.gworksheet_paper_trade.update_values(crange=f"A{next_row}", values=[values], extend=True)
+            return True
         except:
             print("Exception while writing paper trade row to PaperTradeData")
             traceback.print_exc()
+            return False

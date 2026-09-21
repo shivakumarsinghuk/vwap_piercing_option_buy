@@ -26,5 +26,15 @@ class LogicVwapPiercingOptionsInterface(ILogicInterface):
             self.obj_logic.get_thread_info().join()
             print("After Joining thread")
 
+    def force_close_open_trade(self):
+        if not self.obj_logic:
+            return
+        print("FORCE_CLOSE_OPEN_TRADE: checking live trade state before executor exit")
+        for ds in self.obj_logic.directions.values():
+            if ds.state == self.obj_logic.STATE_IN_TRADE and ds.current_trade is not None:
+                print("FORCE_CLOSE_OPEN_TRADE: closing live trade", ds.direction, ds.option_symbol, ds.current_trade.entry_timestamp)
+                self.obj_logic._VwapPiercingEngine__finalize_trade_at_eod_live(ds, "Executor Stop")
+                print("FORCE_CLOSE_OPEN_TRADE: write attempted for", ds.direction, ds.option_symbol)
+
     def get_broker_utility(self):
         return self.obj_logic.get_broker_utility()
