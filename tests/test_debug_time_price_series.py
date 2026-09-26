@@ -1,4 +1,4 @@
-# Run: python -m BusinessLogic.vwappiercing_options.tests.test_debug_time_price_series --key <path> [--date YYYY-MM-DD]
+# Run: python -m BusinessLogic.vwap_piercing_option_buy.tests.test_debug_time_price_series --key <path> [--date YYYY-MM-DD]
 # -*- coding: utf-8 -*-
 """
 test_debug_time_price_series.py

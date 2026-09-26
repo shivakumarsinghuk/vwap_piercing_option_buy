@@ -1,4 +1,4 @@
-# Run: python -m BusinessLogic.vwappiercing_options.tests.test_fyers_option_chain --key <path>
+# Run: python -m BusinessLogic.vwap_piercing_option_buy.tests.test_fyers_option_chain --key <path>
 # -*- coding: utf-8 -*-
 """
 test_fyers_option_chain.py

@@ -1,4 +1,4 @@
-# Run: python -m BusinessLogic.vwappiercing_options.tests.test_fetch_historical_candles --key <path> [--date YYYY-MM-DD] [--interval 15]
+# Run: python -m BusinessLogic.vwap_piercing_option_buy.tests.test_fetch_historical_candles --key <path> [--date YYYY-MM-DD] [--interval 15]
 # -*- coding: utf-8 -*-
 """
 test_fetch_historical_candles.py

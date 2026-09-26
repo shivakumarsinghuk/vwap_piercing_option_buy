@@ -1,4 +1,4 @@
-# Run: python -m BusinessLogic.vwappiercing_options.run_backtest --key <path> [--days 30 | --start-date YYYY-MM-DD --end-date YYYY-MM-DD] [--interval 5]
+# Run: python -m BusinessLogic.vwap_piercing_option_buy.run_backtest --key <path> [--days 30 | --start-date YYYY-MM-DD --end-date YYYY-MM-DD] [--interval 5]
 # -*- coding: utf-8 -*-
 """
 run_backtest.py
