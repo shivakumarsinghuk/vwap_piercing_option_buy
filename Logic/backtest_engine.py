@@ -21,12 +21,12 @@ from .piercing_engine import (
     VwapPiercingEngine, Mode, STATUS_NO_DATA, STATUS_OK,
     determine_best_case_exit, describe_exit_outcomes, _exit_pnl_points,
 )
-from .pattern_rules import resolve_front_month_future_symbol
 
 
 def run_backtest_for_day(broker, index_name, trade_date_str, candle_interval_minutes, log_fn=None):
     """
-    Returns (list_of_paper_trade_row, future_symbol, status) for one trading day.
+    Returns (list_of_paper_trade_row, option_symbols, status) for one trading day, where
+    option_symbols is the CE/PE contract(s) selected that day, joined with "/".
     log_fn, if given, is called with a string for each pattern event (Piercing/Reclaim/
     invalidation/Confirm-Entry/SL-close) -- pass print for a verbose dry-run trace.
     """
@@ -43,9 +43,9 @@ def run_backtest_for_day(broker, index_name, trade_date_str, candle_interval_min
         runs = list(executor.map(run_option_engine, ("CE", "PE")))
 
     results = [trade for option_results, _, _ in runs for trade in option_results]
-    future_symbol = next((symbol for _, symbol, _ in runs if symbol), "")
+    option_symbols = "/".join(symbol for _, symbol, _ in runs if symbol)
     statuses = [status for _, _, status in runs]
 
     if all(status == STATUS_NO_DATA for status in statuses):
-        return results, future_symbol, STATUS_NO_DATA
-    return results, future_symbol, STATUS_OK
+        return results, option_symbols, STATUS_NO_DATA
+    return results, option_symbols, STATUS_OK

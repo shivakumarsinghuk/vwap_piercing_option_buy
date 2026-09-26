@@ -34,7 +34,8 @@ from enum import Enum
 from BusinessLogic.interfaces.ILogic import *
 from BrokerUtility.pal.utility_manager import *
 from Utility.quotes_utility import *
-from Utility.utility import compute_vwap, compute_bollinger_bands, get_target_price_by_percentage, generate_weekly_expiry_dates
+from Utility.utility import compute_vwap, compute_bollinger_bands, get_target_price_by_percentage, generate_weekly_expiry_dates, \
+    generate_monthly_expiry_dates
 from DataTypes.defines import *
 from ..DataTypes.paper_trade_data import paper_trade_row, candle_snapshot, exit_hit
 from ..UserInterface.adapter.login.login import *
@@ -70,6 +71,12 @@ CHAIN_UNDERLYING_SYMBOL = {"NIFTY": "NIFTY50-INDEX", "BANKNIFTY": "NIFTYBANK-IND
 # BACKTEST-only historical option lookups are per-symbol calls (no batched chain-quote
 # equivalent exists for a past date) -- pace them to stay under the broker's rate limit.
 HISTORICAL_OPTION_LOOKUP_DELAY_SECONDS = 0.5
+
+# BACKTEST-only memo of the last strike successfully selected per (index_name, option_type),
+# kept at module scope (not per engine instance) because BACKTEST builds a fresh engine per
+# trading day -- lets __select_historical_option reuse yesterday's strike as today's starting
+# point instead of re-running its wide coarse probe every single day.
+_LAST_SELECTED_STRIKE = {}
 
 
 class _DirectionState:
@@ -114,8 +121,7 @@ class VwapPiercingEngine(ILogic):
 
     # Zebu's fetchOHLC/get_quotes/place_order treat market_type="" as "this is an option
     # symbol, parse strike/expiry out of it via __get_option_name" and market_type="EQ" as
-    # "append -EQ". A future symbol needs any other non-empty value so it's used as-is and
-    # resolved to NFO. Options are trickier: __get_option_name's re-parse assumes a
+    # "append -EQ". Options are trickier: __get_option_name's re-parse assumes a
     # "<STRIKE><CE|PE>" suffix format, but real Zebu option symbols (from get_option_chain) are
     # "<SYMBOL><DDMONYY><C|P><STRIKE>" -- re-parsing an already-correct symbol through that
     # mismatched format would corrupt it. Since our option symbols always come pre-resolved,
@@ -123,7 +129,6 @@ class VwapPiercingEngine(ILogic):
     # value gets a "-{market_type}" suffix appended, which corrupts an already-complete Fyers
     # option symbol) -- so the correct sentinel is genuinely broker-specific. Each broker utility
     # class exposes its own correct value via `OPTION_MARKET_TYPE`; see __option_market_type().
-    FUTURE_MARKET_TYPE = "FUT"
     OPTION_MARKET_TYPE = "OPT"  # fallback default if a broker doesn't declare its own
 
     def __init__(self, mode: Mode, option_type="CE", **kwargs):
@@ -142,9 +147,7 @@ class VwapPiercingEngine(ILogic):
 
         # Each option type runs the BUY pattern independently; CE and PE are separate
         # instruments, but neither is treated as a SELL strategy.
-        self.future_symbol = ""
         self.signal_option_symbol = ""
-        self.current_expiry = ""
         # Preselected cheapest options for runtime (CE and PE)
         self.preselected_options = {"CE": (None, 0.0), "PE": (None, 0.0)}
         self.directions = {self.trade_direction: _DirectionState(self.trade_direction)}
@@ -216,17 +219,6 @@ class VwapPiercingEngine(ILogic):
     def pre_requisite_thread_handler(self):
         print(self.logic_name, ": Inside pre-requisite thread")
         broker = self.trade_utility.get_broker_utility()
-        # NIFTY here trades MONTHLY futures, not weekly -- reuse the same resolution the backtest
-        # engine uses (incl. its last-week-of-month rollover to next month's contract) so live and
-        # backtest can never disagree on which contract is "front month" on a given day.
-        today_str = date.today().strftime("%Y-%m-%d")
-        self.future_symbol, self.current_expiry = pattern_rules.resolve_front_month_future_symbol(
-            broker, self.index_name, today_str)
-        print(self.logic_name, ": Future symbol resolved: ", self.future_symbol)
-        # Zebu's fetchOHLC/get_quotes treat market_type="" as "parse this as an option symbol"
-        # (see zebumynt_utitlity.fetchOHLC / __get_option_name); a future needs any non-empty,
-        # non-"EQ" value so the symbol is used as-is and resolved to NFO.
-        self.quotes_utility.add_stocks([self.future_symbol], [self.FUTURE_MARKET_TYPE])
 
         # Pre-select cheapest CE and PE in the target premium band using option chain
         try:
@@ -413,7 +405,6 @@ class VwapPiercingEngine(ILogic):
         quote_data = self.quotes_utility.get_quote_data()
         if ds.option_symbol not in quote_data:
             return
-        future_ltp = quote_data[self.future_symbol].ltp if self.future_symbol in quote_data else ds.current_trade.entry_future_price
         option_ltp = quote_data[ds.option_symbol].ltp
         now_str = datetime.now().strftime("%H:%M:%S")
 
@@ -427,25 +418,24 @@ class VwapPiercingEngine(ILogic):
 
         was_hit = self.__snapshot_exit_hits(ds.current_trade)
 
-        self.__mark_exit_if_hit_point(ds, ds.current_trade.sl_hit, ds.sl_level, option_ltp, now_str, is_stop=True)
-        self.__mark_exit_if_hit_point(ds, ds.current_trade.exit1_hit, ds.exit1_level, option_ltp, now_str)
-        self.__mark_exit_if_hit_point(ds, ds.current_trade.exit2_hit, ds.exit2_level, option_ltp, now_str)
+        self.__mark_exit_if_hit_point(ds.current_trade.sl_hit, ds.sl_level, option_ltp, now_str, is_stop=True)
+        self.__mark_exit_if_hit_point(ds.current_trade.exit1_hit, ds.exit1_level, option_ltp, now_str)
+        self.__mark_exit_if_hit_point(ds.current_trade.exit2_hit, ds.exit2_level, option_ltp, now_str)
         self.__mark_exit3_if_hit_point(ds, option_ltp, now_str)
-        self.__mark_exit_if_hit_point(ds, ds.current_trade.exit4_10_hit, ds.exit4_10_level, option_ltp, now_str,
+        self.__mark_exit_if_hit_point(ds.current_trade.exit4_10_hit, ds.exit4_10_level, option_ltp, now_str,
                           record_target_price=True)
-        self.__mark_exit_if_hit_point(ds, ds.current_trade.exit4_15_hit, ds.exit4_15_level, option_ltp, now_str,
+        self.__mark_exit_if_hit_point(ds.current_trade.exit4_15_hit, ds.exit4_15_level, option_ltp, now_str,
                           record_target_price=True)
-        self.__mark_exit_if_hit_point(ds, ds.current_trade.exit4_20_hit, ds.exit4_20_level, option_ltp, now_str,
+        self.__mark_exit_if_hit_point(ds.current_trade.exit4_20_hit, ds.exit4_20_level, option_ltp, now_str,
                           record_target_price=True)
-        self.__mark_exit_if_hit_point(ds, ds.current_trade.exit4_30_hit, ds.exit4_30_level, option_ltp, now_str,
+        self.__mark_exit_if_hit_point(ds.current_trade.exit4_30_hit, ds.exit4_30_level, option_ltp, now_str,
                           record_target_price=True)
-        self.__mark_exit_if_hit_point(ds, ds.current_trade.exit4_40_hit, ds.exit4_40_level, option_ltp, now_str,
+        self.__mark_exit_if_hit_point(ds.current_trade.exit4_40_hit, ds.exit4_40_level, option_ltp, now_str,
                           record_target_price=True)
 
         self.__log_exit_breaches(ds, was_hit)
 
-        self.__log_once_per_candle(ds, f": [{now_str}] ({ds.direction}) in-trade LTP={future_ltp} "
-             f"({self.__fmt_option_price(option_ltp)}) SL={ds.sl_level} "
+        self.__log_once_per_candle(ds, f": [{now_str}] ({ds.direction}) in-trade LTP={option_ltp} SL={ds.sl_level} "
              f"Exit1={ds.exit1_level:.2f} Exit2={ds.exit2_level:.2f} Exit3={ds.exit3_level:.2f} "
              f"(option-price based)")
 
@@ -456,7 +446,7 @@ class VwapPiercingEngine(ILogic):
             self.__stamp_mae_mfe(ds)
             self.__finalize_and_reset_live(ds, "SL")
 
-    def __mark_exit_if_hit_point(self, ds: _DirectionState, exit_hit_obj: exit_hit, level, option_ltp, now_str,
+    def __mark_exit_if_hit_point(self, exit_hit_obj: exit_hit, level, option_ltp, now_str,
                                  is_stop=False, record_target_price=False):
         # LIVE checks a single LTP point against the level (tick-driven; no High/Low range).
         if exit_hit_obj.is_hit or level == 0.0:
@@ -466,7 +456,6 @@ class VwapPiercingEngine(ILogic):
         else:
             hit = option_ltp >= level
         if hit:
-            exit_hit_obj.future_price = ds.current_trade.entry_future_price
             exit_hit_obj.option_price = level if record_target_price else option_ltp
             exit_hit_obj.timestamp = now_str
             exit_hit_obj.is_hit = True
@@ -476,7 +465,6 @@ class VwapPiercingEngine(ILogic):
         if exit_hit_obj.is_hit or ds.exit3_level == 0.0:
             return
         if option_ltp >= ds.exit3_level:
-            exit_hit_obj.future_price = ds.current_trade.entry_future_price
             exit_hit_obj.option_price = ds.current_trade.entry_option_price + 7.0
             exit_hit_obj.timestamp = now_str
             exit_hit_obj.is_hit = True
@@ -496,10 +484,8 @@ class VwapPiercingEngine(ILogic):
 
     def __finalize_trade_at_eod_live(self, ds: _DirectionState, reason="EOD"):
         quote_data = self.quotes_utility.get_quote_data()
-        future_ltp = quote_data[self.future_symbol].ltp if self.future_symbol in quote_data else ds.current_trade.entry_future_price
         option_ltp = quote_data[ds.option_symbol].ltp if ds.option_symbol in quote_data else ds.current_trade.entry_option_price
 
-        ds.current_trade.exit5_eod.future_price = future_ltp
         ds.current_trade.exit5_eod.option_price = option_ltp
         ds.current_trade.exit5_eod.timestamp = datetime.now().strftime("%H:%M:%S")
         self.__stamp_mae_mfe(ds)
@@ -507,7 +493,7 @@ class VwapPiercingEngine(ILogic):
         self.__finalize_and_reset_live(ds, reason)
 
     def __finalize_and_reset_live(self, ds: _DirectionState, reason="EOD"):
-        print(self.logic_name, f": FINALIZING LIVE TRADE reason={reason} direction={ds.direction} option={ds.option_symbol} entry={ds.current_trade.entry_future_price} ts={ds.current_trade.entry_timestamp}")
+        print(self.logic_name, f": FINALIZING LIVE TRADE reason={reason} direction={ds.direction} option={ds.option_symbol} entry={ds.current_trade.entry_trigger_price} ts={ds.current_trade.entry_timestamp}")
         self.obj_paper_trade_writer.write_trade(ds.current_trade, self.candle_interval_minutes,
                                                 describe_exit_outcomes(ds.current_trade))
         close_option_price = ds.current_trade.sl_hit.option_price if reason == "SL" \
@@ -535,40 +521,107 @@ class VwapPiercingEngine(ILogic):
         chain_df, _, _ = broker.getOptionChain(underlying)
         return select_cheapest_in_band(chain_df, option_type, self.target_premium_low, self.target_premium_high)
 
-    def __select_historical_option(self, entry_future_price, option_type, ts):
-        # BACKTEST only: there's no historical equivalent of getOptionChain (it only ever answers
-        # "what's the premium right now"), so the ~40 candidate strikes around ATM have to be
-        # checked individually via their own historical 1-min close near the entry minute.
-        # NIFTY options here trade WEEKLY (unlike the future, which is monthly) -- resolve the
-        # week's expiry as of the historical trade date, not the future's monthly expiry.
-        atm_strike = round(entry_future_price / self.strike_step) * self.strike_step
+    def __select_historical_option(self, option_type, ts):
+        """
+        BACKTEST only, option-price only: no underlying price is used anywhere in this
+        search -- only the option contracts' own historical closes decide which one gets
+        selected. Finds the cheapest weekly contract of option_type whose historical close near
+        ts falls inside [target_premium_low, target_premium_high].
+
+        There's no historical equivalent of getOptionChain (it only ever answers "what's the
+        premium right now"), and probing every possible strike every call is far too many
+        rate-limited historical fetches (see HISTORICAL_OPTION_LOOKUP_DELAY_SECONDS). Instead:
+        a "center" strike is memoized per (index, option_type) across calls in this process
+        (_LAST_SELECTED_STRIKE) -- the underlying rarely moves far day-to-day, so most calls
+        only need the narrow ~40-candidate scan around wherever the previous call last found the
+        option. The first-ever call for a given index/option_type seeds that center from the
+        live option chain instead (the strike of today's cheapest in-band option -- option data
+        only). If the fine scan finds nothing in-band around the center, __locate walks from it
+        in the direction the option's own premium points (only ever near-the-money strikes, so
+        it never requests unlisted far-away ones) until it's close to the band.
+        """
         trade_date = datetime.strptime(self.trade_date_str, "%Y-%m-%d")
         weekly_expiry = generate_weekly_expiry_dates(trade_date, 1)[0]
+        # the last weekly expiry of a month IS the monthly expiry, and brokers name it with the
+        # monthly format (Fyers: NIFTY26SEP23200PE, not NIFTY2692923200PE -- the latter is
+        # rejected as "Invalid symbol provided").
+        is_month_expiry = weekly_expiry in generate_monthly_expiry_dates(trade_date, 1)
 
-        # probe the ATM strike alone first -- if this whole weekly expiry has since been
-        # delisted (confirmed in practice: Fyers returns "Invalid symbol provided" for expired
-        # weekly option contracts, not just "no data"), every one of the other ~40 candidates
-        # would fail identically. Bail out here instead of grinding through all of them.
-        probe_symbol = self.broker.get_option_name(self.index_name, weekly_expiry, False, str(atm_strike), option_type)
-        probe_price = self.__historical_option_close_near(probe_symbol, ts)
-        if probe_price is None:
-            self.__log(f"[{ts}] No historical option data available for expiry {weekly_expiry} "
-                      f"(likely delisted) -- skipping the rest of the strike scan for this trade")
+        def probe(strike):
+            symbol = self.broker.get_option_name(self.index_name, weekly_expiry, is_month_expiry, str(strike), option_type)
+            return symbol, self.__historical_option_close_near(symbol, ts)
+
+        def fine_scan(center_strike):
+            best_symbol, best_price, best_strike = None, 0.0, None
+            for offset in range(-20, 21):
+                strike = center_strike + offset * self.strike_step
+                symbol, price = probe(strike)
+                if price is None or price <= 0:
+                    continue
+                if self.target_premium_low <= price <= self.target_premium_high:
+                    if best_symbol is None or price < best_price:
+                        best_symbol, best_price, best_strike = symbol, price, strike
+            return best_symbol, best_price, best_strike
+
+        def seed_from_chain():
+            # Today's option chain (option prices only): the strike of the cheapest option of
+            # this type currently inside the premium band.
+            try:
+                underlying = CHAIN_UNDERLYING_SYMBOL.get(self.index_name, self.index_name)
+                chain_df, _, _ = self.broker.getOptionChain(underlying)
+                symbol, _ = select_cheapest_in_band(chain_df, option_type,
+                                                    self.target_premium_low, self.target_premium_high)
+                if not symbol or "strike_price" not in chain_df.columns:
+                    return None
+                # compare without any exchange prefix ("NSE:...") on either side
+                bare = str(symbol).split(":")[-1]
+                row = chain_df[chain_df["symbol"].astype(str).str.split(":").str[-1] == bare]
+                return int(float(row.iloc[0]["strike_price"])) if len(row) else None
+            except Exception:
+                return None
+
+        def locate(start_strike):
+            # Walk from start_strike toward the premium band using only the option's own
+            # premium: a CE's premium falls as the strike rises, a PE's rises with it. Stops once
+            # the premium is near the band -- the fine scan (+/-20 strikes) then picks the exact
+            # cheapest in-band contract. Step halves whenever the walk overshoots and turns back.
+            strike, step, direction = start_strike, 5 * self.strike_step, 0
+            for _ in range(40):
+                _, price = probe(strike)
+                if price is not None and price > 0:
+                    if self.target_premium_low / 2 <= price <= self.target_premium_high * 2:
+                        return strike
+                    too_rich = price > self.target_premium_high
+                    new_direction = (1 if too_rich else -1) * (1 if option_type == "CE" else -1)
+                    if direction and new_direction != direction:
+                        step = max(self.strike_step, step // 2)
+                    direction = new_direction
+                elif not direction:
+                    # no data at the very start (e.g. a thinly traded strike) -- nudge toward
+                    # cheaper/OTM strikes until something prices
+                    direction = 1 if option_type == "CE" else -1
+                strike += direction * step
+            return None
+
+        key = (self.index_name, option_type)
+        center = _LAST_SELECTED_STRIKE.get(key) or seed_from_chain()
+        if center is None:
+            self.__log(f"[{ts}] Could not seed an option strike (no previous selection and no "
+                      f"in-band option in the current option chain)")
             return None, 0.0
 
-        best_symbol, best_price = None, 0.0
-        for offset in range(-20, 21):
-            strike = atm_strike + offset * self.strike_step
-            if offset == 0:
-                symbol, price = probe_symbol, probe_price  # already fetched above, don't refetch
-            else:
-                symbol = self.broker.get_option_name(self.index_name, weekly_expiry, False, str(strike), option_type)
-                price = self.__historical_option_close_near(symbol, ts)
-            if price is None or price <= 0:
-                continue
-            if self.target_premium_low <= price <= self.target_premium_high:
-                if best_symbol is None or price < best_price:
-                    best_symbol, best_price = symbol, price
+        # locate first (one probe if the center is already near the band) so a stale center
+        # doesn't cost a full 41-strike fine scan before the miss is noticed
+        located = locate(center)
+        if located is None:
+            self.__log(f"[{ts}] No {option_type} option near the "
+                      f"{self.target_premium_low:.0f}-{self.target_premium_high:.0f} band for "
+                      f"expiry {weekly_expiry} (likely delisted/no trading this day)")
+            return None, 0.0
+        best_symbol, best_price, best_strike = fine_scan(located)
+
+        if best_symbol is not None:
+            _LAST_SELECTED_STRIKE[key] = best_strike
         return best_symbol, best_price
 
     def __historical_option_close_near(self, option_symbol, ts):
@@ -590,7 +643,10 @@ class VwapPiercingEngine(ILogic):
         # candles regardless of ts. Trusting the broker to have already cut it off at ts would
         # (and did) return the same end-of-day candle for every lookup on a given day, no matter
         # when ts actually was. Filter down to the candle nearest (at or before) ts ourselves.
-        filtered = data[data[DATE_TIME].astype(str) <= ts]
+        # Compared on time-of-day only (all rows are this one trade date) so it holds regardless
+        # of which date format ts or the broker's DATE_TIME column happens to use.
+        cutoff = pattern_rules.time_of_day(ts)
+        filtered = data[data[DATE_TIME].astype(str).map(pattern_rules.time_of_day) <= cutoff]
         if len(filtered) == 0:
             return None
         return float(filtered.iloc[-1][CLOSE_PRICE])
@@ -608,36 +664,28 @@ class VwapPiercingEngine(ILogic):
     # ------------------------------------------------------------------
     def run_backtest_day(self):
         """
-        Returns (list_of_paper_trade_row, future_symbol, status) for one historical trading day.
+        Returns (list_of_paper_trade_row, option_symbol, status) for one historical trading day.
         Mirrors the live engine's state machine exactly (same shared handler methods below) but
         replays a single pre-fetched day of candles in one pass instead of polling threads.
         """
         broker = self.broker
-        future_symbol, _ = pattern_rules.resolve_front_month_future_symbol(broker, self.index_name, self.trade_date_str)
-        self.future_symbol = future_symbol
 
         str_from_date = f"{self.trade_date_str} {DAY_START_TIME}"
         str_to_date = f"{self.trade_date_str} 15:30:00"
-        candle_data = broker.fetchOHLC(future_symbol, str_from_date, str_to_date,
-                                       interval=f"{self.candle_interval_minutes}minute",
-                                       all_data=True, market_type="FUT")
-        if candle_data is None or len(candle_data) == 0:
-            return [], future_symbol, STATUS_NO_DATA
 
-        # Select the BUY option once from the opening underlying price, then run the pattern
-        # entirely on that option's candles. The future is used only to identify the contract.
-        signal_ts = str(candle_data.iloc[0][DATE_TIME])
-        signal_option_symbol, _ = self.__select_historical_option(
-            float(candle_data.iloc[0][CLOSE_PRICE]), self.option_type, signal_ts)
+        # Select the BUY option from the options' own opening premiums, then run the pattern
+        # entirely on that option's candles.
+        signal_ts = str_from_date
+        signal_option_symbol, _ = self.__select_historical_option(self.option_type, signal_ts)
         if not signal_option_symbol:
-            return [], future_symbol, STATUS_NO_DATA
+            return [], "", STATUS_NO_DATA
         self.signal_option_symbol = signal_option_symbol
         option_candle_data = broker.fetchOHLC(
             signal_option_symbol, str_from_date, str_to_date,
             interval=f"{self.candle_interval_minutes}minute", all_data=True,
             market_type=self.__option_market_type())
         if option_candle_data is None or len(option_candle_data) == 0:
-            return [], future_symbol, STATUS_NO_DATA
+            return [], signal_option_symbol, STATUS_NO_DATA
         candle_data = option_candle_data
 
         # Zebu's "intvwap" field is a per-candle (interval) VWAP, not a cumulative session VWAP
@@ -698,7 +746,6 @@ class VwapPiercingEngine(ILogic):
                 trade = ds.current_trade
                 last_ts = str(candle_data.iloc[-1][DATE_TIME])
                 last_close = float(candle_data.iloc[-1][CLOSE_PRICE])
-                trade.exit5_eod.future_price = last_close
                 trade.exit5_eod.option_price = self.__historical_option_close_near(ds.option_symbol, last_ts) or 0.0
                 trade.exit5_eod.timestamp = last_ts
                 trade.mae, trade.mae_time = ds.mae, ds.mae_time
@@ -707,7 +754,7 @@ class VwapPiercingEngine(ILogic):
                 self.__log(f"End of day ({direction}): trade still open (SL not hit), closed at last price "
                           f"{last_close} ({self.__fmt_option_price(trade.exit5_eod.option_price)})")
 
-        return self.results, future_symbol, STATUS_OK
+        return self.results, signal_option_symbol, STATUS_OK
 
     def __check_reclaim_backtest(self, ds: _DirectionState, row, sub_rows, ts):
         for r in sub_rows:
@@ -773,7 +820,6 @@ class VwapPiercingEngine(ILogic):
         # SL/Exit-1..4 state.
         if pattern_rules.is_force_exit_time_reached(pattern_rules.time_of_day(ts)):
             close_price = float(row[CLOSE_PRICE])
-            trade.exit5_eod.future_price = close_price
             trade.exit5_eod.option_price = option_price
             trade.exit5_eod.timestamp = ts
             self.__stamp_mae_mfe(ds)
@@ -786,22 +832,22 @@ class VwapPiercingEngine(ILogic):
         was_hit = self.__snapshot_exit_hits(trade)
 
         if option_price is not None:
-            self.__mark_exit_if_hit_range(ds, trade.sl_hit, ds.sl_level, row, ds.direction, ts,
+            self.__mark_exit_if_hit_range(trade.sl_hit, ds.sl_level, row, ds.direction, ts,
                                           option_price=option_price, is_stop=True)
-            self.__mark_exit_if_hit_range(ds, trade.exit1_hit, ds.exit1_level, row, ds.direction, ts,
+            self.__mark_exit_if_hit_range(trade.exit1_hit, ds.exit1_level, row, ds.direction, ts,
                                           option_price=option_price)
-            self.__mark_exit_if_hit_range(ds, trade.exit2_hit, ds.exit2_level, row, ds.direction, ts,
+            self.__mark_exit_if_hit_range(trade.exit2_hit, ds.exit2_level, row, ds.direction, ts,
                                           option_price=option_price)
             self.__mark_exit3_if_hit_candle(ds, row, ts, option_price)
-            self.__mark_exit_if_hit_range(ds, trade.exit4_10_hit, ds.exit4_10_level, row, ds.direction, ts,
+            self.__mark_exit_if_hit_range(trade.exit4_10_hit, ds.exit4_10_level, row, ds.direction, ts,
                                           option_price=option_price, record_target_price=True)
-            self.__mark_exit_if_hit_range(ds, trade.exit4_15_hit, ds.exit4_15_level, row, ds.direction, ts,
+            self.__mark_exit_if_hit_range(trade.exit4_15_hit, ds.exit4_15_level, row, ds.direction, ts,
                                           option_price=option_price, record_target_price=True)
-            self.__mark_exit_if_hit_range(ds, trade.exit4_20_hit, ds.exit4_20_level, row, ds.direction, ts,
+            self.__mark_exit_if_hit_range(trade.exit4_20_hit, ds.exit4_20_level, row, ds.direction, ts,
                                           option_price=option_price, record_target_price=True)
-            self.__mark_exit_if_hit_range(ds, trade.exit4_30_hit, ds.exit4_30_level, row, ds.direction, ts,
+            self.__mark_exit_if_hit_range(trade.exit4_30_hit, ds.exit4_30_level, row, ds.direction, ts,
                                           option_price=option_price, record_target_price=True)
-            self.__mark_exit_if_hit_range(ds, trade.exit4_40_hit, ds.exit4_40_level, row, ds.direction, ts,
+            self.__mark_exit_if_hit_range(trade.exit4_40_hit, ds.exit4_40_level, row, ds.direction, ts,
                                           option_price=option_price, record_target_price=True)
 
         # Exit-4 target: Bollinger upper band for BUY, lower band for SELL -- price reaching
@@ -809,8 +855,7 @@ class VwapPiercingEngine(ILogic):
         # hypothesis only, same as Exit-1..3: breaching it is logged, not a real exit.
         bollinger_level = self.__get_bollinger_exit_level_backtest(ds)
         bollinger_str = f"{bollinger_level:.2f}" if bollinger_level is not None else "n/a"
-        # The BUY strategy's exit decisions are based on option premium only; the
-        # underlying future's Bollinger band is not an exit trigger.
+        # The BUY strategy's exit decisions are based on option premium only.
 
         self.__log_exit_breaches(ds, was_hit)
 
@@ -916,7 +961,7 @@ class VwapPiercingEngine(ILogic):
             self.__log(msg)
         return True
 
-    def __enter_trade(self, ds: _DirectionState, entry_future_price, ts, main_row=None):
+    def __enter_trade(self, ds: _DirectionState, entry_trigger_price, ts, main_row=None):
         option_symbol, option_price = "", 0.0
         option_type = self.option_type
         if self.mode == Mode.LIVE:
@@ -953,17 +998,16 @@ class VwapPiercingEngine(ILogic):
 
         trade = paper_trade_row()
         trade.date = date.today().strftime("%Y-%m-%d") if self.mode == Mode.LIVE else self.trade_date_str
-        trade.future = self.future_symbol
         trade.option_name = option_symbol
         trade.trade_type = ds.direction
         trade.piercing_candle = self.__to_snapshot(ds.piercing_candle)
         trade.reclaim_candle = self.__to_snapshot(ds.reclaim_candle, ds.reclaim_vwap)
         if self.mode == Mode.LIVE:
-            trade.confirm_candle = candle_snapshot(timestamp=ts, open=entry_future_price, high=entry_future_price,
-                                                   low=entry_future_price, close=entry_future_price, vwap=0.0)
+            trade.confirm_candle = candle_snapshot(timestamp=ts, open=entry_trigger_price, high=entry_trigger_price,
+                                                   low=entry_trigger_price, close=entry_trigger_price, vwap=0.0)
         else:
             trade.confirm_candle = self.__to_snapshot(main_row)
-        trade.entry_future_price = entry_future_price
+        trade.entry_trigger_price = entry_trigger_price
         trade.entry_option_price = option_price
         trade.entry_timestamp = ts
 
@@ -1000,7 +1044,7 @@ class VwapPiercingEngine(ILogic):
             # suppressed by the candle timestamp already logged during the waiting-for-entry phase.
             ds.last_logged_candle_ts = None
             print(self.logic_name, ": LIVE ENTRY", ds.direction, option_symbol, "@", option_price,
-                  "future_entry=", entry_future_price, "ts=", ts)
+                  "entry_trigger=", entry_trigger_price, "ts=", ts)
         else:
             # Exit-4 (Bollinger) isn't fixed at entry like SL/Exit-1..3 -- it moves every candle
             # (checked in __check_in_trade_backtest below). Shown here is just its value at the
@@ -1008,14 +1052,14 @@ class VwapPiercingEngine(ILogic):
             entry_bollinger_level = self.__get_bollinger_exit_level_backtest(ds)
             exit4_str = f"{entry_bollinger_level:.2f}" if entry_bollinger_level is not None else "n/a"
             option_str = f"{option_symbol} @{option_price:.2f}" if option_symbol else "none found"
-            self.__log(f"[{ts}] ({ds.direction}) CONFIRM/ENTRY @ {entry_future_price} "
+            self.__log(f"[{ts}] ({ds.direction}) CONFIRM/ENTRY @ {entry_trigger_price} "
                       f"(piercing: {ds.piercing_candle[DATE_TIME]}, reclaim: {ds.reclaim_candle[DATE_TIME]}) "
                       f"SL={ds.sl_level} Exit1={ds.exit1_level:.2f} Exit2={ds.exit2_level:.2f} Exit3={ds.exit3_level:.2f} "
                       f"Exit4(@entry)={exit4_str} Option={option_str}")
 
-    def __update_mae_mfe_point(self, ds: _DirectionState, future_ltp, ts):
-        # LIVE: single LTP point excursion from entry, per tick.
-        excursion = future_ltp - ds.current_trade.entry_option_price
+    def __update_mae_mfe_point(self, ds: _DirectionState, option_ltp, ts):
+        # single option-price point excursion from entry.
+        excursion = option_ltp - ds.current_trade.entry_option_price
         if excursion < ds.mae:
             ds.mae, ds.mae_time = excursion, ts
         if excursion > ds.mfe:
@@ -1024,8 +1068,8 @@ class VwapPiercingEngine(ILogic):
     def __update_mae_mfe_range(self, ds: _DirectionState, high, low, ts):
         # BACKTEST: worst/best excursion across this candle's whole High/Low range, per candle.
         trade = ds.current_trade
-        worst = (low - trade.entry_future_price) if ds.direction == "BUY" else (trade.entry_future_price - high)
-        best = (high - trade.entry_future_price) if ds.direction == "BUY" else (trade.entry_future_price - low)
+        worst = (low - trade.entry_trigger_price) if ds.direction == "BUY" else (trade.entry_trigger_price - high)
+        best = (high - trade.entry_trigger_price) if ds.direction == "BUY" else (trade.entry_trigger_price - low)
         if worst < ds.mae:
             ds.mae, ds.mae_time = worst, ts
         if best > ds.mfe:
@@ -1061,16 +1105,16 @@ class VwapPiercingEngine(ILogic):
                 continue
             opt_str = self.__fmt_option_price(hit_obj.option_price)
             if self.mode == Mode.LIVE:
-                print(self.logic_name, f": ({ds.direction}) {label} target BREACHED @ {hit_obj.future_price} ({opt_str})",
+                print(self.logic_name, f": ({ds.direction}) {label} target BREACHED @ {opt_str}",
                      "(hypothesis only -- trade continues, only SL closes it)")
             else:
-                self.__log(f"[{hit_obj.timestamp}] ({ds.direction}) {label} target BREACHED @ {hit_obj.future_price} ({opt_str}) "
+                self.__log(f"[{hit_obj.timestamp}] ({ds.direction}) {label} target BREACHED @ {opt_str} "
                           f"(hypothesis only -- trade continues, only SL closes it)")
 
-    def __mark_exit_if_hit_range(self, ds: _DirectionState, exit_hit_obj: exit_hit, level, row, direction, ts,
+    def __mark_exit_if_hit_range(self, exit_hit_obj: exit_hit, level, row, direction, ts,
                                  option_price=None, is_stop=False, record_target_price=False):
-        # Historical option data is sampled at the closest 1-minute close; no future candle
-        # value participates in deciding whether an option exit is hit.
+        # Historical option data is sampled at the closest 1-minute close; only the option's
+        # own price decides whether an exit is hit.
         if exit_hit_obj.is_hit:
             return
         if option_price is None:
@@ -1080,7 +1124,6 @@ class VwapPiercingEngine(ILogic):
         else:
             hit = option_price >= level
         if hit:
-            exit_hit_obj.future_price = ds.current_trade.entry_future_price
             exit_hit_obj.option_price = level if record_target_price else option_price
             exit_hit_obj.timestamp = ts
             exit_hit_obj.is_hit = True
@@ -1091,7 +1134,6 @@ class VwapPiercingEngine(ILogic):
         if exit_hit_obj.is_hit or ds.exit3_level == 0.0:
             return
         if float(row[HIGH_PRICE]) >= ds.exit3_level:
-            exit_hit_obj.future_price = ds.current_trade.entry_future_price
             exit_hit_obj.option_price = ds.current_trade.entry_option_price + 7.0
             exit_hit_obj.timestamp = ts
             exit_hit_obj.is_hit = True

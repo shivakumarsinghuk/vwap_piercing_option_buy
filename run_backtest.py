@@ -3,7 +3,7 @@
 """
 run_backtest.py
 
-Replays a range of trading days of NIFTY future candles through the VWAP
+Replays a range of trading days of NIFTY option candles through the VWAP
 Piercing pattern (Piercing -> Reclaim -> Confirm -> SL/Exit-1..4, piercing-
 window gated, multiple trades/day if SL triggers) and writes one row per
 detected trade to the BackTestData tab of the VWAPPiercingOptions Google
@@ -24,14 +24,11 @@ before the trade closed (e.g. "Exit1:+23.90, Exit3:+65.20 (Best: Exit3)"),
 or "SL" if none of them were ever hit -- see Logic/backtest_engine.py's
 describe_exit_outcomes().
 
-NIFTY here trades MONTHLY futures (confirmed via search_scrip -- only ~1
-contract/month is ever listed), not weekly despite superficially similar
-"F"-suffixed naming. The front-month contract for each historical day is
-computed locally (no network call) via
-Logic/backtest_engine.py:resolve_front_month_future_symbol(). Days whose
-contract has since expired/been delisted from the broker's instrument
-master (fetchOHLC returns no data) are skipped with a clear message rather
-than failing the whole run.
+The option traded each day is picked from the options' own historical
+premiums (cheapest in the target band) -- no futures data is used. Days whose
+weekly option contracts have since expired/been delisted from the broker's
+instrument master (fetchOHLC returns no data) are skipped with a clear
+message rather than failing the whole run.
 """
 import argparse
 from datetime import datetime, timedelta
@@ -98,17 +95,17 @@ if __name__ == "__main__":
 
     for trade_date in trading_days:
         try:
-            results, future_symbol, status = run_backtest_for_day(broker, args.index, trade_date, candle_interval)
+            results, option_symbols, status = run_backtest_for_day(broker, args.index, trade_date, candle_interval)
         except Exception as e:
             print(f"{trade_date}: exception during backtest -- {e}")
             no_data_days.append(trade_date)
             continue
 
         if status == STATUS_NO_DATA:
-            print(f"{trade_date} ({future_symbol}): no candle data -- contract likely expired/delisted, skipping")
+            print(f"{trade_date}: no option data in the {args.index} premium band -- contract likely expired/delisted, skipping")
             no_data_days.append(trade_date)
         elif not results:
-            print(f"{trade_date} ({future_symbol}): no valid entry")
+            print(f"{trade_date} ({option_symbols}): no valid entry")
             no_entry_days.append(trade_date)
         else:
             for result in results:
@@ -116,7 +113,7 @@ if __name__ == "__main__":
                 writer.write_trade(result, candle_interval, exit_outcomes)
                 written += 1
                 sl_note = "SL hit" if result.sl_hit.is_hit else "still open at EOD"
-                print(f"{trade_date} ({future_symbol}): {result.trade_type} @ {result.entry_future_price} "
+                print(f"{trade_date} ({result.option_name}): {result.trade_type} @ {result.entry_trigger_price} "
                      f"({sl_note}, exits: {exit_outcomes}) -- written to BackTestData")
 
     print(f"\nDone. {written} trade(s) written to BackTestData, "

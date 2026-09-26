@@ -39,9 +39,9 @@ if __name__ == "__main__":
     trade_date = args.date or nse_utility.get_prev_day_trade_date(preset=0)
     print("Using trade date:", trade_date)
 
-    results, future_symbol, status = run_backtest_for_day(broker, args.index, trade_date, args.interval, log_fn=print)
+    results, option_symbols, status = run_backtest_for_day(broker, args.index, trade_date, args.interval, log_fn=print)
 
-    print("Future symbol:", future_symbol)
+    print("Option symbol(s):", option_symbols)
 
     if status == STATUS_NO_DATA:
         print("No candle data returned -- nothing to dry-run (contract may be expired/delisted, or date/interval invalid).")
@@ -50,5 +50,5 @@ if __name__ == "__main__":
     print(f"\nDone. {len(results)} trade(s) detected on {trade_date}:")
     for r in results:
         sl_note = f"SL hit @ {r.sl_hit.timestamp}" if r.sl_hit.is_hit else "still open at EOD"
-        print(f"  {r.trade_type} @ {r.entry_future_price} (entry {r.entry_timestamp}) -- {sl_note}, "
+        print(f"  {r.trade_type} @ {r.entry_trigger_price} (entry {r.entry_timestamp}) -- {sl_note}, "
              f"MAE={r.mae:.2f} MFE={r.mfe:.2f}, exits: {describe_exit_outcomes(r)}")

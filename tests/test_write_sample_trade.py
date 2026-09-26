@@ -19,7 +19,6 @@ from BusinessLogic.vwap_piercing_option_buy.Logic.backtest_engine import describ
 def build_sample_row():
     row = paper_trade_row()
     row.date = date.today().strftime("%Y-%m-%d")
-    row.future = "NIFTY31JUL25F"
     row.option_name = "NIFTY31JUL2524600CE"
     row.trade_type = "BUY"
 
@@ -30,16 +29,16 @@ def build_sample_row():
     row.confirm_candle = candle_snapshot(timestamp="10:00:00", open=24610.0, high=24610.0,
                                          low=24610.0, close=24610.0, vwap=0.0)
 
-    row.entry_future_price = 24610.0
+    row.entry_trigger_price = 105.0
     row.entry_option_price = 105.0
     row.entry_timestamp = "10:00:15"
 
-    row.sl_hit = exit_hit(future_price=24540.0, option_price=70.0, timestamp="10:20:00", is_hit=True)
-    row.exit1_hit = exit_hit(future_price=24680.0, option_price=145.0, timestamp="11:05:00", is_hit=True)
-    row.exit2_hit = exit_hit(future_price=24733.0, option_price=170.0, timestamp="12:10:00", is_hit=False)
-    row.exit3_hit = exit_hit(future_price=24795.0, option_price=190.0, timestamp="", is_hit=False)
-    row.exit4_hit = exit_hit(future_price=24500.0, option_price=60.0, timestamp="", is_hit=False)
-    row.exit5_eod = eod_exit(future_price=24650.0, option_price=120.0)
+    row.sl_hit = exit_hit(option_price=70.0, timestamp="10:20:00", is_hit=True)
+    row.exit1_hit = exit_hit(option_price=145.0, timestamp="11:05:00", is_hit=True)
+    row.exit2_hit = exit_hit(option_price=170.0, timestamp="12:10:00", is_hit=False)
+    row.exit3_hit = exit_hit(option_price=190.0, timestamp="", is_hit=False)
+    row.exit4_hit = exit_hit(option_price=60.0, timestamp="", is_hit=False)
+    row.exit5_eod = eod_exit(option_price=120.0)
 
     row.mae = -70.0
     row.mae_time = "10:20:00"

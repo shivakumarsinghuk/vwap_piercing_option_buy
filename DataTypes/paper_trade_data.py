@@ -20,7 +20,6 @@ class candle_snapshot:
 
 @dataclass
 class exit_hit:
-    future_price: float = 0.0
     option_price: float = 0.0
     timestamp: str = ""
     is_hit: bool = False
@@ -31,7 +30,6 @@ class exit_hit:
 
 @dataclass
 class eod_exit:
-    future_price: float = 0.0
     option_price: float = 0.0
     timestamp: str = ""
 
@@ -42,7 +40,6 @@ class eod_exit:
 @dataclass
 class paper_trade_row:
     date: str = ""
-    future: str = ""
     option_name: str = ""
     trade_type: str = ""
 
@@ -50,7 +47,7 @@ class paper_trade_row:
     reclaim_candle: candle_snapshot = field(default_factory=candle_snapshot)
     confirm_candle: candle_snapshot = field(default_factory=candle_snapshot)
 
-    entry_future_price: float = 0.0
+    entry_trigger_price: float = 0.0
     entry_option_price: float = 0.0
     entry_timestamp: str = ""
 
@@ -98,7 +95,7 @@ class paper_trade_row:
         row += [self.entry_timestamp, self.entry_option_price]
         row += self.sl_hit.to_row()
 
-        # Standard exit hits (each returns [future_price, option_price, timestamp])
+        # Standard exit hits (each returns [timestamp, option_price])
         row += self.exit1_hit.to_row()
         row += self.exit2_hit.to_row()
         row += [self.exit3_hit.timestamp,
