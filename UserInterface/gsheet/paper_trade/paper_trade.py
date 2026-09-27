@@ -2,11 +2,18 @@
 """
 paper_trade.py
 """
+import threading
 import traceback
 
 from Utility.gsheet_utility import *
 from ....DataTypes.paper_trade_data import *
 from ..backtest.backtest import HEADER_ROWS
+
+
+# The CE and PE engines each hold a writer and can close trades at the same moment; the
+# find-next-empty-row-then-write below must not interleave, or both pick the same row and one
+# trade overwrites the other.
+_WRITE_LOCK = threading.Lock()
 
 
 class UserInterfacePaperTrade:
@@ -48,14 +55,15 @@ class UserInterfacePaperTrade:
             # the next startup, wiping that trade, which is exactly why live runs left this sheet
             # looking empty while BackTestData (which floors its first data row at 3) kept its
             # rows. Floor at row 3 for the same reason.
-            rows = self.gworksheet_paper_trade.get_all_values()
-            last_populated_row = max(
-                (row_number for row_number, row in enumerate(rows, start=1)
-                 if any(str(cell).strip() for cell in row)),
-                default=0,
-            )
-            next_row = max(last_populated_row + 1, 3)
-            self.gworksheet_paper_trade.update_values(crange=f"A{next_row}", values=[values], extend=True)
+            with _WRITE_LOCK:
+                rows = self.gworksheet_paper_trade.get_all_values()
+                last_populated_row = max(
+                    (row_number for row_number, row in enumerate(rows, start=1)
+                     if any(str(cell).strip() for cell in row)),
+                    default=0,
+                )
+                next_row = max(last_populated_row + 1, 3)
+                self.gworksheet_paper_trade.update_values(crange=f"A{next_row}", values=[values], extend=True)
             return True
         except:
             print("Exception while writing paper trade row to PaperTradeData")
