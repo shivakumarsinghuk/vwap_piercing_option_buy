@@ -28,6 +28,7 @@ force-closed at the prevailing price regardless of SL/Exit-1..4 state.
 """
 import threading
 import time
+import traceback
 from datetime import datetime, date, timedelta
 from enum import Enum
 
@@ -218,8 +219,11 @@ class VwapPiercingEngine(ILogic):
         self.candle_interval_minutes = int(self.config_data.candle_interval)
         self.piercing_start_time = pattern_rules.compute_piercing_start_time(self.execution_start_time)
 
-        self.processed_candle_count = 0
-        self.processed_candle_count_5min = 0
+        # timestamp of the last candle processed per series, not a row count -- the signal option
+        # can be re-selected while idle (see __refresh_signal_option_live), and a count into the
+        # old option's series would point at the wrong candle in the new one's.
+        self.last_processed_candle_ts = None
+        self.last_processed_candle_ts_5min = None
 
         self.pre_requisite_thread = threading.Thread(target=self.pre_requisite_thread_handler)
         self.execute_thread = threading.Thread(target=self.execute)
@@ -310,6 +314,7 @@ class VwapPiercingEngine(ILogic):
                 piercing_window_announced = True
 
             now_str = self.__now().strftime("%Y-%m-%d %H:%M:%S")
+            self.__refresh_signal_option_live()
             self.__process_new_candles_live(now_str)
 
             for ds in self.directions.values():
@@ -363,26 +368,57 @@ class VwapPiercingEngine(ILogic):
 
             self.last_candle_data = candle_data
 
-            new_rows = candle_data.iloc[self.processed_candle_count:]
+            new_rows = self.__rows_after(candle_data, self.last_processed_candle_ts)
             for _, row in new_rows.iterrows():
                 for ds in self.directions.values():
                     if ds.state == STATE_SEEK_PIERCING:
                         ts = str(row[DATE_TIME])
                         self.__check_seek_piercing(ds, row, ts)
 
-            self.processed_candle_count = len(candle_data)
+            self.last_processed_candle_ts = candle_data[DATE_TIME].iloc[-1]
 
         # Reclaim is checked against 5-min candles while still measured against the main
         # interval's own VWAP (self.last_candle_data), not a separate 5-min VWAP.
         candle_data_5min = self.__fetch_candles_live(broker, signal_symbol, 5, str_from_date, str_to_date)
         if candle_data_5min is not None and len(candle_data_5min) > 0:
-            new_rows_5min = candle_data_5min.iloc[self.processed_candle_count_5min:]
+            new_rows_5min = self.__rows_after(candle_data_5min, self.last_processed_candle_ts_5min)
             for _, row in new_rows_5min.iterrows():
                 for ds in self.directions.values():
                     if ds.state == STATE_SEEK_RECLAIM:
                         self.__on_reclaim_5min_close_live(ds, row)
 
-            self.processed_candle_count_5min = len(candle_data_5min)
+            self.last_processed_candle_ts_5min = candle_data_5min[DATE_TIME].iloc[-1]
+
+    def __rows_after(self, candle_data, last_ts):
+        # the candles strictly after last_ts (all of them on the first pass)
+        if last_ts is None:
+            return candle_data
+        return candle_data[candle_data[DATE_TIME] > last_ts]
+
+    def __refresh_signal_option_live(self):
+        """
+        Normal LIVE only: while no setup or trade is in progress (every direction still seeking a
+        piercing), re-pick the cheapest in-band option from the live chain on every pass, so the
+        pattern is watched on the option that's in the premium band NOW rather than the one that
+        was at start-up. Once a piercing forms, the option is frozen until the setup/trade ends.
+        On any failure the current option is kept.
+        """
+        if self.test_mode or any(ds.state != STATE_SEEK_PIERCING for ds in self.directions.values()):
+            return
+        try:
+            symbol, price = self.__select_option_by_premium(self.trade_utility.get_broker_utility(),
+                                                            self.option_type)
+        except Exception:
+            print(self.logic_name, ": Option chain lookup failed; keeping", self.signal_option_symbol or "no option")
+            traceback.print_exc()
+            return
+        if not symbol:
+            return
+        self.preselected_options[self.option_type] = (symbol, price)
+        if symbol != self.signal_option_symbol:
+            print(self.logic_name, f": signal option changed {self.signal_option_symbol or 'none'} -> {symbol} @ {price}")
+            self.signal_option_symbol = symbol
+            self.quotes_utility.add_stocks([symbol], [self.__option_market_type()])
 
     def __on_reclaim_5min_close_live(self, ds: _DirectionState, row):
         # row is a 5-min candle; vwap is looked up from the main-interval series so reclaim is
@@ -753,9 +789,13 @@ class VwapPiercingEngine(ILogic):
         # Normal LIVE: ask the broker for today's candles up to now. Test mode: no broker call --
         # the test day's candles (fetched once) that have closed by the simulated time.
         if not self.test_mode:
-            return broker.fetchOHLC(symbol, str_from_date, now_str,
+            # Fyers ignores the time-of-day in the range and returns the whole day so far,
+            # INCLUDING the candle still forming -- drop it, or its cursor would move past that
+            # candle after seeing only its first few seconds and never check it once closed.
+            data = broker.fetchOHLC(symbol, str_from_date, now_str,
                                     interval=f"{interval_minutes}minute", all_data=True,
                                     market_type=self.__option_market_type())
+            return self.__closed_by(data, interval_minutes, now_str)
         return self.__closed_by(self.__test_day_series(broker, symbol, interval_minutes),
                                 interval_minutes, now_str)
 
