@@ -44,8 +44,12 @@ from ..DataTypes.paper_trade_data import paper_trade_row, candle_snapshot, exit_
 from ..UserInterface.adapter.login.login import *
 from ..UserInterface.adapter.config.config import *
 from ..UserInterface.gsheet.paper_trade.paper_trade import *
+from ..UserInterface.gsheet.order_log.order_log import *
+from ..DataTypes.order_log_data import order_log_row
+from ..Config.config_loader import load_order_config
 from . import pattern_rules
 from .option_selection import select_by_premium, select_cheapest_in_band
+from .webhook_order import send_webhook_order
 
 
 class Mode(Enum):
@@ -109,6 +113,12 @@ class _DirectionState:
 
         self.current_trade: paper_trade_row = None
         self.option_symbol = ""
+        # LIVE only: quantity of the real BUY placed for this position (0 = no real position,
+        # so no SELL is sent on exit).
+        self.order_quantity = 0
+        # LIVE only: the closed trade's PaperTradeData row is already written, so a failed SELL
+        # retried on later exit checks doesn't write it again.
+        self.paper_trade_logged = False
         self.sl_level = 0.0
         self.exit1_level = 0.0
         self.exit2_level = 0.0
@@ -209,6 +219,22 @@ class VwapPiercingEngine(ILogic):
             self.log_fn = lambda msg: print(self.logic_name, ":", msg)
             # (symbol, interval_minutes) -> that symbol's whole test-day candle series
             self.test_symbol_candles = {}
+
+        # Config/order_config.json: whether entries/exits send real orders via the broker utility
+        self.order_cfg = load_order_config()
+        # test mode is governed only by place_order_in_test_mode, normal LIVE only by place_order
+        order_switch = "place_order_in_test_mode" if self.test_mode else "place_order"
+        self.place_orders = bool(self.order_cfg[order_switch])
+        if self.place_orders:
+            print(self.logic_name, ": WARNING -- REAL ORDER PLACEMENT ENABLED via", self.order_cfg["order_route"] + ":",
+                  self.order_cfg["order_type"], self.order_cfg["product_type"],
+                  f"{self.__order_quantity()} qty ({self.order_cfg['lot_count']} x {self.order_cfg['lot_size']})",
+                  "-- TEST MODE REPLAY" if self.test_mode else "")
+            # every placed/failed order gets a row in the OrderLog sheet
+            self.obj_order_log_writer = UserInterfaceOrderLog(args.key)
+        else:
+            print(self.logic_name, f": Real order placement disabled (paper trade only) -- "
+                                   f"{order_switch} is {self.order_cfg[order_switch]!r} in Config/order_config.json")
 
         self.pre_requisite_complete_event = threading.Event()
         self.day_preset = 0
@@ -582,14 +608,39 @@ class VwapPiercingEngine(ILogic):
 
     def __finalize_and_reset_live(self, ds: _DirectionState, reason="EOD"):
         print(self.logic_name, f": FINALIZING LIVE TRADE reason={reason} direction={ds.direction} option={ds.option_symbol} entry={ds.current_trade.entry_trigger_price} ts={ds.current_trade.entry_timestamp}")
-        self.obj_paper_trade_writer.write_trade(ds.current_trade, self.candle_interval_minutes,
-                                                describe_exit_outcomes(ds.current_trade))
         close_option_price = ds.current_trade.sl_hit.option_price if reason == "SL" \
             else ds.current_trade.exit5_eod.option_price
-        print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}) @ {self.__fmt_option_price(close_option_price)}, logged to PaperTradeData:",
-             ds.current_trade.trade_type, ds.current_trade.option_name)
+
+        # PaperTradeData logs the strategy's signal regardless of what the broker did with the real
+        # orders (OrderLog has that) -- write it before attempting the SELL, and only once, so a
+        # failed SELL that's retried on later exit checks neither hides nor duplicates the row.
+        if not ds.paper_trade_logged:
+            self.obj_paper_trade_writer.write_trade(ds.current_trade, self.candle_interval_minutes,
+                                                    describe_exit_outcomes(ds.current_trade))
+            ds.paper_trade_logged = True
+            print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}) @ {self.__fmt_option_price(close_option_price)}, logged to PaperTradeData:",
+                 ds.current_trade.trade_type, ds.current_trade.option_name)
+
+        # Square off the real position, only if the entry BUY actually succeeded
+        # (order_quantity is 0 otherwise). Normal LIVE: a failed SELL must NOT reset the state
+        # machine -- we'd stop tracking a position we still hold -- so keep the trade open and
+        # let the next exit check retry. Test mode: ignore the failure and close the trade.
+        if ds.order_quantity:
+            if not self.__place_real_order(ds.option_symbol, "SELL", ds.order_quantity,
+                                           close_option_price, reason):
+                if not self.test_mode:
+                    print(self.logic_name, f": ({ds.direction}) REAL EXIT ORDER FAILED for {ds.option_symbol} "
+                          f"({reason}) -- POSITION STILL OPEN, not resetting; will retry on the next exit check "
+                          f"(square off manually if the engine is stopping)")
+                    return
+                print(self.logic_name, f": ({ds.direction}) REAL EXIT ORDER FAILED for {ds.option_symbol} "
+                      f"({reason}) -- TEST MODE: ignoring and closing the trade (square off manually if "
+                      f"a real position was opened)")
+
         ds.current_trade = None
         ds.option_symbol = ""
+        ds.order_quantity = 0
+        ds.paper_trade_logged = False
         ds.piercing_candle = None
         ds.reclaim_candle = None
         ds.last_logged_candle_ts = None
@@ -600,6 +651,81 @@ class VwapPiercingEngine(ILogic):
     def __option_market_type(self):
         broker = self.trade_utility.get_broker_utility() if self.mode == Mode.LIVE else self.broker
         return getattr(broker, "OPTION_MARKET_TYPE", self.OPTION_MARKET_TYPE)
+
+    def __order_quantity(self):
+        return int(self.order_cfg["lot_size"]) * int(self.order_cfg["lot_count"])
+
+    def __limit_price(self, transaction_type, reference_price):
+        # LIMIT only: reference +/- buffer%, rounded to the exchange tick size
+        buffer = float(self.order_cfg["limit_buffer_percent"]) / 100.0
+        price = reference_price * (1 + buffer if transaction_type == "BUY" else 1 - buffer)
+        tick = float(self.order_cfg["tick_size"])
+        return round(round(price / tick) * tick, 2)
+
+    def __place_real_order(self, symbol, transaction_type, quantity, reference_price, reason):
+        """
+        LIVE only: sends a real order through the broker utility (callers check
+        self.place_orders / ds.order_quantity first). Returns True if the broker returned an
+        order id. place_order already retries internally and returns "" on failure; the
+        catch-all here is so a bad symbol/permission error can never crash the engine mid-trade.
+        """
+        order_type = self.order_cfg["order_type"]
+        price = self.__limit_price(transaction_type, reference_price) if order_type == "LIMIT" else 0
+        if self.order_cfg["order_route"] == "webhook":
+            # FYERS Automate webhook: Fyers' own servers place the order (see webhook_order.py)
+            _, order_id = send_webhook_order(self.order_cfg["webhook_url"], self.order_cfg["webhook_payload"], {
+                "symbol": symbol,
+                "fyers_symbol": f"{self.order_cfg['exchange']}:{symbol}",
+                "transaction_type": transaction_type,
+                "side": 1 if transaction_type == "BUY" else -1,
+                "quantity": quantity,
+                "order_type": order_type,
+                "product": self.order_cfg["product_type"],
+                "price": price,
+                "reference_price": reference_price,
+                "option_type": self.option_type,
+                "reason": reason,
+            })
+        else:
+            broker = self.trade_utility.get_broker_utility()
+            try:
+                order_id = broker.place_order(
+                    tradingsymbol=symbol,
+                    transaction_type=transaction_type,
+                    quantity=quantity,
+                    product=self.order_cfg["product_type"],
+                    order_type=order_type,
+                    price=price,
+                    exchange=self.order_cfg["exchange"],
+                    market_type=self.__option_market_type(),
+                )
+            except Exception:
+                print(self.logic_name, f": REAL ORDER EXCEPTION placing {transaction_type} {quantity} x {symbol}")
+                traceback.print_exc()
+                order_id = ""
+        success = bool(order_id)
+        print(self.logic_name, f": REAL ORDER {'PLACED' if success else 'FAILED'} via {self.order_cfg['order_route']} -- {transaction_type} "
+              f"{quantity} x {symbol} {order_type}{f' @ {price}' if price else ''} ({reason}, ref={reference_price})",
+              f"order_id={order_id!r}" if success else "")
+        # one OrderLog row per attempt, success or failure -- a stuck exit shows up as repeated
+        # FAILED rows until one goes through. Wall-clock time: this is when the real order was sent.
+        now = datetime.now()
+        self.obj_order_log_writer.write_order(order_log_row(
+            timestamp=now.strftime("%H:%M:%S"),
+            date=now.strftime("%Y-%m-%d"),
+            option_name=symbol,
+            option_type=self.option_type,
+            order_type="Entry" if transaction_type == "BUY" else "Exit",
+            transaction_type=transaction_type,
+            quantity=quantity,
+            price_type=order_type,
+            limit_price=price,
+            order_id=order_id,
+            status="PLACED" if success else "FAILED",
+            reason=f"{reason} (test mode {self.session_date_str})" if self.test_mode else reason,
+            reference_price=reference_price,
+        ))
+        return success
 
     def __select_option_by_premium(self, broker, option_type):
         # Fyers' real getOptionChain() returns strike/type/live-premium for every contract around
@@ -1108,6 +1234,16 @@ class VwapPiercingEngine(ILogic):
                 current_price = self.__ltp(option_symbol)
                 if current_price is not None:
                     option_price = current_price
+            # The paper trade goes ahead regardless of the real order -- PaperTradeData logs the
+            # strategy's signals, OrderLog logs what the broker did. Only a successful BUY sets
+            # order_quantity, so only a real position gets a SELL on exit.
+            if self.place_orders:
+                if self.__place_real_order(option_symbol, "BUY", self.__order_quantity(),
+                                           option_price, "Entry"):
+                    ds.order_quantity = self.__order_quantity()
+                else:
+                    print(self.logic_name, f": ({ds.direction}) Real BUY order FAILED for {option_symbol} "
+                          f"-- no real position opened, continuing as paper trade only")
         else:
             # BACKTEST: real historical premiums, unlike the live path, aren't available from a
             # single batched call -- resolve the ~40 candidate strikes around ATM the same way

@@ -11,8 +11,9 @@ shared engine in LIVE mode with the constructor shape executor.py's
 LOGIC_REGISTRY / interfaces.py expect (args, broker_utility_manager,
 quotes_utility), started on threads exactly as before.
 
-No real orders are placed here -- it's a signal + logging engine only, each
-completed trade logged to the PaperTradeData sheet.
+Each completed trade is logged to the PaperTradeData sheet. Real orders (BUY on
+entry, SELL on exit) are sent through the broker utility only when
+Config/order_config.json's place_order is true -- otherwise it's paper trade only.
 """
 from .piercing_engine import VwapPiercingEngine, Mode
 
