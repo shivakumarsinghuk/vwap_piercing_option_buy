@@ -19,7 +19,7 @@ HEADER_ROWS = [
         "Exit-2 (Piercing Candle Length)", "",
         "Exit-3 (7 Points)", "",
         "Exit-4 (10 Points)", "",
-        "Exit-5(15 Points)", "",
+        "Exit-5 (Bollinger Band)", "",
         "Exit-6 (20 Points)", "",
         "Exit-7 (30 Points)", "",
         "Exit-8 (40 Points)", "",

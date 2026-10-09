@@ -124,7 +124,6 @@ class _DirectionState:
         self.exit2_level = 0.0
         self.exit3_level = 0.0
         self.exit4_10_level = 0.0
-        self.exit4_15_level = 0.0
         self.exit4_20_level = 0.0
         self.exit4_30_level = 0.0
         self.exit4_40_level = 0.0
@@ -537,8 +536,9 @@ class VwapPiercingEngine(ILogic):
         self.__mark_exit3_if_hit_point(ds, option_ltp, now_str)
         self.__mark_exit_if_hit_point(ds.current_trade.exit4_10_hit, ds.exit4_10_level, option_ltp, now_str,
                           record_target_price=True)
-        self.__mark_exit_if_hit_point(ds.current_trade.exit4_15_hit, ds.exit4_15_level, option_ltp, now_str,
-                          record_target_price=True)
+        # Exit-5 (Bollinger) moves every candle, so it records the actual LTP that crossed it
+        self.__mark_exit_if_hit_point(ds.current_trade.exit4_hit,
+                                      self.__bollinger_exit_level(ds, self.__now()) or 0.0, option_ltp, now_str)
         self.__mark_exit_if_hit_point(ds.current_trade.exit4_20_hit, ds.exit4_20_level, option_ltp, now_str,
                           record_target_price=True)
         self.__mark_exit_if_hit_point(ds.current_trade.exit4_30_hit, ds.exit4_30_level, option_ltp, now_str,
@@ -582,12 +582,24 @@ class VwapPiercingEngine(ILogic):
             exit_hit_obj.timestamp = now_str
             exit_hit_obj.is_hit = True
 
-    def __get_bollinger_exit_level_live(self, ds: _DirectionState):
-        # Exit-4 target: Bollinger upper band for BUY, lower band for SELL -- price reaching the
-        # band in the trade's favor, same target-style semantics as Exit-1..3 (not a stop).
-        if self.last_candle_data is None or len(self.last_candle_data) < self.bollinger_period:
+    def __bollinger_exit_level(self, ds: _DirectionState, moment):
+        # Exit-5 target: Bollinger upper band for BUY, lower band for SELL, on the main-interval
+        # candles that had fully closed by `moment` -- the still-forming candle is left out so the
+        # band never uses a close that hasn't happened yet. Same target-style semantics as
+        # Exit-1..4 (not a stop).
+        data = self.last_candle_data
+        if data is None:
             return None
-        upper_band, middle_band, lower_band = compute_bollinger_bands(self.last_candle_data,
+        closed = 0
+        for k in range(len(data)):
+            start = datetime.strptime(f"{moment.strftime('%Y-%m-%d')} {pattern_rules.time_of_day(str(data.iloc[k][DATE_TIME]))}",
+                                      "%Y-%m-%d %H:%M:%S")
+            if start + timedelta(minutes=self.candle_interval_minutes) > moment:
+                break
+            closed = k + 1
+        if closed < self.bollinger_period:
+            return None
+        upper_band, middle_band, lower_band = compute_bollinger_bands(data.iloc[:closed],
                                                                        period=self.bollinger_period,
                                                                        std_dev=self.bollinger_std_dev)
         band_value = upper_band.iloc[-1] if ds.direction == "BUY" else lower_band.iloc[-1]
@@ -1098,7 +1110,7 @@ class VwapPiercingEngine(ILogic):
         # Exit-4 (Bollinger) is informational only here -- logged, not an exit.
         bollinger_level = self.__get_bollinger_exit_level_backtest(ds)
         bollinger_str = f"{bollinger_level:.2f}" if bollinger_level is not None else "n/a"
-        self.__log(f"[{ts}] ({ds.direction}) in-trade {self.__fmt_candle(row)} SL={ds.sl_level} Exit4(Bollinger)={bollinger_str}")
+        self.__log(f"[{ts}] ({ds.direction}) in-trade {self.__fmt_candle(row)} SL={ds.sl_level} Exit5(Bollinger)={bollinger_str}")
 
     def __run_in_trade_minutes_backtest(self, ds: _DirectionState, bars):
         for bar in bars:
@@ -1297,7 +1309,6 @@ class VwapPiercingEngine(ILogic):
         ds.exit2_level = option_entry_price + (2 * piercing_length)
         ds.exit3_level = option_entry_price + 7.0
         ds.exit4_10_level = option_entry_price + 10.0
-        ds.exit4_15_level = option_entry_price + 15.0
         ds.exit4_20_level = option_entry_price + 20.0
         ds.exit4_30_level = option_entry_price + 30.0
         ds.exit4_40_level = option_entry_price + 40.0
@@ -1328,7 +1339,7 @@ class VwapPiercingEngine(ILogic):
             self.__log(f"[{ts}] ({ds.direction}) CONFIRM/ENTRY @ {entry_trigger_price} "
                       f"(piercing: {ds.piercing_candle[DATE_TIME]}, reclaim: {ds.reclaim_candle[DATE_TIME]}) "
                       f"SL={ds.sl_level} Exit1={ds.exit1_level:.2f} Exit2={ds.exit2_level:.2f} Exit3={ds.exit3_level:.2f} "
-                      f"Exit4(@entry)={exit4_str} Option={option_str}")
+                      f"Exit5(@entry)={exit4_str} Option={option_str}")
 
     def __update_mae_mfe_point(self, ds: _DirectionState, option_ltp, ts):
         # single option-price point excursion from entry.
@@ -1363,7 +1374,7 @@ class VwapPiercingEngine(ILogic):
             "Exit1 (Length of Piercing)": trade.exit1_hit.is_hit,
             "Exit2 (2 x Length of Piercing)": trade.exit2_hit.is_hit,
             "Exit3 (7 Points)": trade.exit3_hit.is_hit,
-            "Exit4 (Bollinger)": trade.exit4_hit.is_hit,
+            "Exit5 (Bollinger)": trade.exit4_hit.is_hit,
         }
 
     def __fmt_option_price(self, price):
@@ -1374,7 +1385,7 @@ class VwapPiercingEngine(ILogic):
         for label, hit_obj in (("Exit1 (Length of Piercing)", trade.exit1_hit),
                                ("Exit2 (2 x Length of Piercing)", trade.exit2_hit),
                                ("Exit3 (7 Points)", trade.exit3_hit),
-                               ("Exit4 (Bollinger)", trade.exit4_hit)):
+                               ("Exit5 (Bollinger)", trade.exit4_hit)):
             if was_hit[label] or not hit_obj.is_hit:
                 continue
             opt_str = self.__fmt_option_price(hit_obj.option_price)
@@ -1450,7 +1461,10 @@ class VwapPiercingEngine(ILogic):
         self.__mark_exit_if_hit_point(trade.exit1_hit, ds.exit1_level, close, ts)
         self.__mark_exit_if_hit_point(trade.exit2_hit, ds.exit2_level, close, ts)
         self.__mark_exit3_if_hit_point(ds, max(close, high), ts)
-        for hit_obj, level in ((trade.exit4_10_hit, ds.exit4_10_level), (trade.exit4_15_hit, ds.exit4_15_level),
+        # Exit-5 (Bollinger) moves every candle, so it records the actual close that crossed it
+        self.__mark_exit_if_hit_point(trade.exit4_hit, self.__bollinger_exit_level(ds, self.__candle_start(bar)) or 0.0,
+                                      close, ts)
+        for hit_obj, level in ((trade.exit4_10_hit, ds.exit4_10_level),
                                (trade.exit4_20_hit, ds.exit4_20_level), (trade.exit4_30_hit, ds.exit4_30_level),
                                (trade.exit4_40_hit, ds.exit4_40_level)):
             self.__mark_exit_if_hit_point(hit_obj, level, close, ts, record_target_price=True)
@@ -1523,7 +1537,7 @@ def determine_best_case_exit(trade: paper_trade_row):
     """
     candidates = [(label, _exit_pnl_points(trade, hit_obj))
                  for label, hit_obj in (("Exit1", trade.exit1_hit), ("Exit2", trade.exit2_hit),
-                                        ("Exit3", trade.exit3_hit), ("Exit4", trade.exit4_hit))
+                                        ("Exit3", trade.exit3_hit), ("Exit5", trade.exit4_hit))
                  if hit_obj.is_hit]
     if not candidates:
         return "SL"
@@ -1544,7 +1558,7 @@ def describe_exit_outcomes(trade: paper_trade_row):
     parts = []
     best_label, best_pnl = None, None
     for label, hit_obj in (("Exit1", trade.exit1_hit), ("Exit2", trade.exit2_hit),
-                           ("Exit3", trade.exit3_hit), ("Exit4", trade.exit4_hit)):
+                           ("Exit3", trade.exit3_hit), ("Exit5", trade.exit4_hit)):
         if not hit_obj.is_hit:
             continue
         pnl = _exit_pnl_points(trade, hit_obj)

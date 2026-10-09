@@ -61,12 +61,11 @@ class paper_trade_row:
     exit1_hit: exit_hit = field(default_factory=exit_hit)  # Length Of Piercing
     exit2_hit: exit_hit = field(default_factory=exit_hit)  # 2 x Length Of Piercing
     exit3_hit: exit_hit = field(default_factory=exit_hit)  # 7 Points
-    # Exit-4 (Bollinger target) -- kept for the engine's hypothesis tracking
+    # Exit-5 (Bollinger upper band) -- the "Exit-5" sheet column
     exit4_hit: exit_hit = field(default_factory=exit_hit)
 
     # Multiple fixed-point exits (user listed several "Exit-4" variants)
     exit4_10_hit: exit_hit = field(default_factory=exit_hit)  # 10 Points
-    exit4_15_hit: exit_hit = field(default_factory=exit_hit)  # 15 Points
     exit4_20_hit: exit_hit = field(default_factory=exit_hit)  # 20 Points
     exit4_30_hit: exit_hit = field(default_factory=exit_hit)  # 30 Points
     exit4_40_hit: exit_hit = field(default_factory=exit_hit)  # 40 Points
@@ -101,9 +100,9 @@ class paper_trade_row:
         row += [self.exit3_hit.timestamp,
             self.entry_option_price + 7.0 if self.exit3_hit.is_hit else 0.0]
 
-        # Fixed-point exits
+        # Fixed-point exits, with Exit-5 (Bollinger) in the old 15-point slot
         row += self.exit4_10_hit.to_row()
-        row += self.exit4_15_hit.to_row()
+        row += self.exit4_hit.to_row()
         row += self.exit4_20_hit.to_row()
         row += self.exit4_30_hit.to_row()
         row += self.exit4_40_hit.to_row()
