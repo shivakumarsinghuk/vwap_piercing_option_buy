@@ -856,13 +856,19 @@ class VwapPiercingEngine(ILogic):
         # "nearest" here, not an exact real-time LTP, since no intrabar ticks exist historically.
         if not option_symbol:
             return None
-        str_from = f"{self.trade_date_str} {DAY_START_TIME}"
-        # entry selection alone fires ~40 of these back-to-back (one per candidate strike) --
-        # paced to avoid tripping the broker's per-second rate limit (seen in practice: Fyers
-        # returning HTTP 429 "request limit reached" without this).
-        time.sleep(HISTORICAL_OPTION_LOOKUP_DELAY_SECONDS)
-        data = self.broker.fetchOHLC(option_symbol, str_from, ts, interval="1minute",
-                                     all_data=True, market_type=self.__option_market_type())
+        # each symbol's whole day of 1-min candles is fetched once and reused -- the option is
+        # re-selected at every candle close (see __refresh_signal_option_backtest), probing the
+        # same strikes again each time.
+        cache = self.__dict__.setdefault("_option_minute_cache", {})
+        if option_symbol not in cache:
+            # entry selection alone fires ~40 of these back-to-back (one per candidate strike) --
+            # paced to avoid tripping the broker's per-second rate limit (seen in practice: Fyers
+            # returning HTTP 429 "request limit reached" without this).
+            time.sleep(HISTORICAL_OPTION_LOOKUP_DELAY_SECONDS)
+            cache[option_symbol] = self.broker.fetchOHLC(
+                option_symbol, f"{self.trade_date_str} {DAY_START_TIME}", f"{self.trade_date_str} 15:30:00",
+                interval="1minute", all_data=True, market_type=self.__option_market_type())
+        data = cache[option_symbol]
         if data is None or len(data) == 0:
             return None
         # Some brokers (Fyers confirmed) only support DATE-granularity historical range filters
@@ -966,70 +972,46 @@ class VwapPiercingEngine(ILogic):
         Mirrors the live engine's state machine exactly (same shared handler methods below) but
         replays a single pre-fetched day of candles in one pass instead of polling threads.
         """
-        broker = self.broker
-
         str_from_date = f"{self.trade_date_str} {DAY_START_TIME}"
-        str_to_date = f"{self.trade_date_str} 15:30:00"
 
-        # Select the BUY option from the options' own opening premiums, then run the pattern
-        # entirely on that option's candles.
-        signal_ts = str_from_date
-        signal_option_symbol, _ = self.__select_historical_option(self.option_type, signal_ts)
+        # Select the BUY option from the options' own opening premiums. Like LIVE (see
+        # __refresh_signal_option_live), it's re-picked at every candle close while no setup or
+        # trade is in progress, so the pattern is watched on whichever option is in the premium
+        # band at that moment -- not just the one that was in band at 09:15.
+        signal_option_symbol, _ = self.__select_historical_option(self.option_type, str_from_date)
         if not signal_option_symbol:
             return [], "", STATUS_NO_DATA
-        self.signal_option_symbol = signal_option_symbol
-        option_candle_data = broker.fetchOHLC(
-            signal_option_symbol, str_from_date, str_to_date,
-            interval=f"{self.candle_interval_minutes}minute", all_data=True,
-            market_type=self.__option_market_type())
-        if option_candle_data is None or len(option_candle_data) == 0:
+        if self.__activate_backtest_series(signal_option_symbol) is None:
             return [], signal_option_symbol, STATUS_NO_DATA
-        candle_data = option_candle_data
+        self.signal_option_symbol = signal_option_symbol
 
-        # Zebu's "intvwap" field is a per-candle (interval) VWAP, not a cumulative session VWAP
-        # from day open -- always compute the real cumulative VWAP ourselves instead of trusting it.
-        candle_data[VWAP] = [compute_vwap(candle_data, last_loc=i + 1) for i in range(len(candle_data))]
-        self.last_candle_data = candle_data
+        interval = timedelta(minutes=self.candle_interval_minutes)
+        t = self.__candle_start({DATE_TIME: DAY_START_TIME})
+        day_end = self.__candle_start({DATE_TIME: "15:30:00"})
+        prev_start = None
 
-        # Reclaim is checked against 5-min candles while still measured against the main
-        # interval's own VWAP, not a separate 5-min VWAP. Falls back to the main-interval
-        # series if 5-min data isn't available.
-        candle_data_5min = broker.fetchOHLC(signal_option_symbol, str_from_date, str_to_date,
-                            interval="5minute", all_data=True,
-                            market_type=self.__option_market_type())
-        if candle_data_5min is None or len(candle_data_5min) == 0:
-            candle_data_5min = candle_data
+        while t < day_end:
+            if all(ds.state == STATE_SEEK_PIERCING for ds in self.directions.values()):
+                # LIVE decides at the candle's close, from the latest closed 1-min price
+                self.__refresh_signal_option_backtest(
+                    f"{self.trade_date_str} {(t + interval - timedelta(minutes=1)).strftime('%H:%M:%S')}")
 
-        # Entry and everything after it run minute by minute on the option's 1-min candles, the
-        # same way LIVE test mode does (see __stop_entry_fill / __in_trade_minute).
-        self.minute_data = broker.fetchOHLC(signal_option_symbol, str_from_date, str_to_date,
-                                            interval="1minute", all_data=True,
-                                            market_type=self.__option_market_type())
-        if self.minute_data is None or len(self.minute_data) == 0:
-            self.__log(f"No 1-min candles for {signal_option_symbol} -- entries can't be evaluated this day")
-            self.minute_data, self.minute_starts = None, []
-        else:
-            self.minute_starts = [self.__candle_start(self.minute_data.iloc[k]) for k in range(len(self.minute_data))]
-
-        # Bollinger bands are rolling (causal, only look back), so precomputing over the whole day
-        # upfront and indexing by row is equivalent to recomputing fresh at each candle -- no
-        # lookahead bias.
-        self.upper_band, self.middle_band, self.lower_band = compute_bollinger_bands(
-            candle_data, period=self.bollinger_period, std_dev=self.bollinger_std_dev)
-
-        five_min_idx = 0
-
-        for i in range(len(candle_data)):
+            series = self._backtest_series
+            i = series["index_by_start"].get(t)
+            t += interval
+            if i is None:
+                continue
+            candle_data = series["main"]
             row = candle_data.iloc[i]
             ts = str(row[DATE_TIME])
+            row_start = self.__candle_start(row)
             self._backtest_row_index = i
 
-            # 5-min candles closing within this main-interval candle's window, consumed in order
-            # for the reclaim and confirmation checks.
-            sub_rows = []
-            while five_min_idx < len(candle_data_5min) and str(candle_data_5min.iloc[five_min_idx][DATE_TIME]) <= ts:
-                sub_rows.append(candle_data_5min.iloc[five_min_idx])
-                five_min_idx += 1
+            # 5-min candles starting since the last processed main candle, up to this one, for
+            # the reclaim and confirmation checks.
+            sub_rows = [r for r, s in zip(series["five_min_rows"], series["five_min_starts"])
+                        if (prev_start is None or s > prev_start) and s <= row_start]
+            prev_start = row_start
 
             for direction, ds in self.directions.items():
                 if ds.state in (STATE_SEEK_RECLAIM, STATE_SEEK_CONFIRM_ENTRY) \
@@ -1050,6 +1032,7 @@ class VwapPiercingEngine(ILogic):
 
         # end of day: any direction still IN_TRADE (SL never hit) gets its exit5_eod stamped with
         # the day's last close, mirroring the live engine's EOD finalize.
+        candle_data = self.last_candle_data
         for direction, ds in self.directions.items():
             if ds.state == STATE_IN_TRADE and ds.current_trade is not None:
                 trade = ds.current_trade
@@ -1063,7 +1046,88 @@ class VwapPiercingEngine(ILogic):
                 self.__log(f"End of day ({direction}): trade still open (SL not hit), closed at last price "
                           f"{last_close} ({self.__fmt_option_price(trade.exit5_eod.option_price)})")
 
-        return self.results, signal_option_symbol, STATUS_OK
+        traded = list(dict.fromkeys(trade.option_name for trade in self.results if trade.option_name))
+        return self.results, ",".join(traded) or self.signal_option_symbol, STATUS_OK
+
+    def __refresh_signal_option_backtest(self, ts):
+        # BACKTEST counterpart of __refresh_signal_option_live: re-pick the cheapest in-band
+        # option as of ts; on a miss (or no candles for the new pick) the current one is kept.
+        symbol, price = self.__select_historical_option(self.option_type, ts)
+        if not symbol or symbol == self.signal_option_symbol:
+            return
+        if self.__activate_backtest_series(symbol) is None:
+            self.__activate_backtest_series(self.signal_option_symbol)
+            return
+        self.__log(f"[{ts}] signal option changed {self.signal_option_symbol} -> {symbol} @ {price}")
+        self.signal_option_symbol = symbol
+
+    def __activate_backtest_series(self, symbol):
+        """
+        BACKTEST: make symbol's day of candles (main interval with VWAP, 5-min, 1-min, Bollinger
+        bands) the series the replay runs on, fetching it once per symbol. Returns None if the
+        option has no main-interval candles that day.
+        """
+        cache = self.__dict__.setdefault("_backtest_series_cache", {})
+        if symbol not in cache:
+            cache[symbol] = self.__load_backtest_series(symbol)
+        series = cache[symbol]
+        if series is None:
+            return None
+        self._backtest_series = series
+        self.last_candle_data = series["main"]
+        self.minute_data, self.minute_starts = series["minute"], series["minute_starts"]
+        self.upper_band, self.middle_band, self.lower_band = series["bands"]
+        return series
+
+    def __load_backtest_series(self, symbol):
+        broker = self.broker
+        str_from_date = f"{self.trade_date_str} {DAY_START_TIME}"
+        str_to_date = f"{self.trade_date_str} 15:30:00"
+
+        candle_data = broker.fetchOHLC(symbol, str_from_date, str_to_date,
+                                       interval=f"{self.candle_interval_minutes}minute", all_data=True,
+                                       market_type=self.__option_market_type())
+        if candle_data is None or len(candle_data) == 0:
+            return None
+
+        # Zebu's "intvwap" field is a per-candle (interval) VWAP, not a cumulative session VWAP
+        # from day open -- always compute the real cumulative VWAP ourselves instead of trusting it.
+        candle_data[VWAP] = [compute_vwap(candle_data, last_loc=i + 1) for i in range(len(candle_data))]
+
+        # Reclaim is checked against 5-min candles while still measured against the main
+        # interval's own VWAP, not a separate 5-min VWAP. Falls back to the main-interval
+        # series if 5-min data isn't available.
+        candle_data_5min = broker.fetchOHLC(symbol, str_from_date, str_to_date,
+                                            interval="5minute", all_data=True,
+                                            market_type=self.__option_market_type())
+        if candle_data_5min is None or len(candle_data_5min) == 0:
+            candle_data_5min = candle_data
+
+        # Entry and everything after it run minute by minute on the option's 1-min candles, the
+        # same way LIVE test mode does (see __stop_entry_fill / __in_trade_minute).
+        minute_data = broker.fetchOHLC(symbol, str_from_date, str_to_date,
+                                       interval="1minute", all_data=True,
+                                       market_type=self.__option_market_type())
+        if minute_data is None or len(minute_data) == 0:
+            self.__log(f"No 1-min candles for {symbol} -- entries can't be evaluated on it")
+            minute_data, minute_starts = None, []
+        else:
+            minute_starts = [self.__candle_start(minute_data.iloc[k]) for k in range(len(minute_data))]
+
+        five_min_rows = [candle_data_5min.iloc[k] for k in range(len(candle_data_5min))]
+        return {
+            "main": candle_data,
+            "index_by_start": {self.__candle_start(candle_data.iloc[k]): k for k in range(len(candle_data))},
+            "five_min_rows": five_min_rows,
+            "five_min_starts": [self.__candle_start(r) for r in five_min_rows],
+            "minute": minute_data,
+            "minute_starts": minute_starts,
+            # Bollinger bands are rolling (causal, only look back), so precomputing over the whole
+            # day upfront and indexing by row is equivalent to recomputing fresh at each candle --
+            # no lookahead bias.
+            "bands": compute_bollinger_bands(candle_data, period=self.bollinger_period,
+                                             std_dev=self.bollinger_std_dev),
+        }
 
     def __check_reclaim_backtest(self, ds: _DirectionState, row, sub_rows, ts):
         for r in sub_rows:

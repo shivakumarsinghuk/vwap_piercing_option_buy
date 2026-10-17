@@ -26,6 +26,7 @@ FORCE_EXIT_TIME = "14:50:00"
 # During SEEK_CONFIRM_ENTRY, entry only fires once price has cleared back through VWAP by at
 # least this much -- a bare crossing right on the VWAP line is treated as noise, not a real entry.
 ENTRY_MIN_VWAP_GAP = 5
+PIERCING_MIN_VWAP_GAP = 1
 
 
 def compute_piercing_start_time(execution_start_time):
@@ -67,6 +68,10 @@ def piercing_direction(row):
     body = abs(float(row[CLOSE_PRICE]) - float(row[OPEN_PRICE]))
     top_wick = float(row[HIGH_PRICE]) - max(float(row[OPEN_PRICE]), float(row[CLOSE_PRICE]))
     if body <= top_wick:
+        return None
+    open_gap = abs(float(row[OPEN_PRICE]) - float(row[VWAP]))
+    close_gap = abs(float(row[CLOSE_PRICE]) - float(row[VWAP]))
+    if open_gap <= PIERCING_MIN_VWAP_GAP or close_gap <= PIERCING_MIN_VWAP_GAP:
         return None
     if row[OPEN_PRICE] < row[VWAP] and row[CLOSE_PRICE] > row[VWAP]:
         return "BUY"
