@@ -22,7 +22,7 @@ class UserInterfaceLogin(IUserInterface):
     def __init__(self, key):
         self.data = None
         self.googlesheet_utility = gsheet_utility(account_file=key,
-                                                  spread_sheet_name="VWAPPiercingOptions")
+                                                  spread_sheet_name="VWAP_Piercing_Options_Buy")
         self.gworksheet_brokerdata = self.googlesheet_utility.get_work_sheet("BrokerData")
         self.__set_data()
 

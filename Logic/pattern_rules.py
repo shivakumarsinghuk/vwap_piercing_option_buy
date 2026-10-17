@@ -7,11 +7,9 @@ LogicVwapPiercingOptions state machine and offline testing/dry-run scripts,
 so a dry run against historical candles reflects exactly what the live
 engine would decide.
 """
-import calendar
 from datetime import datetime, timedelta
 
 from DataTypes.defines import *
-from Utility.utility import generate_monthly_expiry_dates
 
 # New Piercing candidates are only looked for once VWAP has had time to settle (15 min after
 # execution start) and stop being looked for at PIERCING_CUTOFF_TIME. A setup already in progress
@@ -25,17 +23,10 @@ PIERCING_CUTOFF_TIME = "14:00:00"
 # above -- it only ever applies to a trade that has actually entered (IN_TRADE).
 FORCE_EXIT_TIME = "14:50:00"
 
-# A piercing candle only counts if its Close has moved at least this far past VWAP -- filters out
-# marginal pierces that are really just noise around the VWAP line.
-PIERCING_MIN_VWAP_GAP = 6
-
-# ...and the candle's Open must already be at least this far from VWAP on the piercing side, so
-# the candle is genuinely piercing through rather than opening right on top of VWAP.
-PIERCING_MIN_OPEN_VWAP_GAP = 5
-
 # During SEEK_CONFIRM_ENTRY, entry only fires once price has cleared back through VWAP by at
 # least this much -- a bare crossing right on the VWAP line is treated as noise, not a real entry.
 ENTRY_MIN_VWAP_GAP = 5
+PIERCING_MIN_VWAP_GAP = 1
 
 
 def compute_piercing_start_time(execution_start_time):
@@ -71,14 +62,20 @@ def time_of_day(date_time_str):
 
 def piercing_direction(row):
     """
-    Returns 'BUY', 'SELL', or None for a candle row (needs OPEN/CLOSE/VWAP). Only counts as a
-    piercing if the Open starts at least PIERCING_MIN_OPEN_VWAP_GAP away from VWAP on the piercing
-    side, and the Close has cleared VWAP on the other side by at least PIERCING_MIN_VWAP_GAP --
-    a marginal open or close right on the VWAP line is treated as noise, not a real piercing.
+    Returns 'BUY', 'SELL', or None for a candle row (needs OPEN/CLOSE/VWAP). A piercing is a
+    candle whose open and close are on opposite sides of VWAP.
     """
-    if row[OPEN_PRICE] < row[VWAP] - PIERCING_MIN_OPEN_VWAP_GAP and row[CLOSE_PRICE] > row[VWAP] + PIERCING_MIN_VWAP_GAP:
+    body = abs(float(row[CLOSE_PRICE]) - float(row[OPEN_PRICE]))
+    top_wick = float(row[HIGH_PRICE]) - max(float(row[OPEN_PRICE]), float(row[CLOSE_PRICE]))
+    if body <= top_wick:
+        return None
+    open_gap = abs(float(row[OPEN_PRICE]) - float(row[VWAP]))
+    close_gap = abs(float(row[CLOSE_PRICE]) - float(row[VWAP]))
+    if open_gap <= PIERCING_MIN_VWAP_GAP or close_gap <= PIERCING_MIN_VWAP_GAP:
+        return None
+    if row[OPEN_PRICE] < row[VWAP] and row[CLOSE_PRICE] > row[VWAP]:
         return "BUY"
-    if row[OPEN_PRICE] > row[VWAP] + PIERCING_MIN_OPEN_VWAP_GAP and row[CLOSE_PRICE] < row[VWAP] - PIERCING_MIN_VWAP_GAP:
+    if row[OPEN_PRICE] > row[VWAP] and row[CLOSE_PRICE] < row[VWAP]:
         return "SELL"
     return None
 
@@ -98,38 +95,3 @@ def is_vwap_reentry_triggered(check_price, vwap, direction):
     return (check_price > vwap + ENTRY_MIN_VWAP_GAP) if direction == "BUY" \
         else (check_price < vwap - ENTRY_MIN_VWAP_GAP)
 
-
-def _is_in_last_week_of_month(trade_date):
-    """True if trade_date falls within the last 7 calendar days of its month."""
-    last_day = calendar.monthrange(trade_date.year, trade_date.month)[1]
-    return trade_date.day > last_day - 7
-
-
-def resolve_front_month_future_symbol(broker, index_name, trade_date_str):
-    """
-    The monthly future contract that was front-month on trade_date_str (no network call).
-    NIFTY here trades MONTHLY futures (confirmed via search_scrip -- only ~1 contract/month is
-    ever listed, e.g. NIFTY28JUL26F / NIFTY25AUG26F / NIFTY29SEP26F), not weekly, despite the
-    "F" suffix looking similar to a weekly naming convention. generate_monthly_expiry_dates()
-    returns the last <p_expiry_day> weekday of each month from trade_date's month onward, but
-    doesn't itself account for trade_date possibly falling after that month's own expiry -- so
-    the first entry isn't always >= trade_date. Pick the first one that actually is.
-
-    During the last calendar week of the month, rolls to next month's contract early instead of
-    the current month's -- liquidity in the current month's contract thins out sharply in its
-    final week as the market rolls over, so testing/trading against it that late isn't
-    representative of what would actually be tradable. Used identically by the live engine
-    (against today's date) and the backtest engine (against each historical trade date).
-    """
-    trade_date = datetime.strptime(trade_date_str, "%Y-%m-%d")
-
-    lookup_date = trade_date
-    if _is_in_last_week_of_month(trade_date):
-        lookup_date = (trade_date.replace(day=28) + timedelta(days=4)).replace(day=1)
-
-    for expiry_str in generate_monthly_expiry_dates(lookup_date, 1):
-        if datetime.strptime(expiry_str, "%d-%b-%Y") >= lookup_date:
-            return broker.get_future_name(index_name, expiry_str), expiry_str
-    # shouldn't happen within the same calendar year, but fall back to the last one generated
-    last_expiry = generate_monthly_expiry_dates(lookup_date, 1)[-1]
-    return broker.get_future_name(index_name, last_expiry), last_expiry

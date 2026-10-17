@@ -1,4 +1,4 @@
-# Run: python -m BusinessLogic.vwappiercing_options.tests.test_broker_login --key <path_to_service_account_json>
+# Run: python -m BusinessLogic.vwap_piercing_option_buy.tests.test_broker_login --key <path_to_service_account_json>
 # -*- coding: utf-8 -*-
 """
 test_broker_login.py

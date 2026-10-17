@@ -20,28 +20,26 @@ class candle_snapshot:
 
 @dataclass
 class exit_hit:
-    future_price: float = 0.0
     option_price: float = 0.0
     timestamp: str = ""
     is_hit: bool = False
 
     def to_row(self):
-        return [self.future_price, self.option_price, self.timestamp]
+        return [self.timestamp, self.option_price]
 
 
 @dataclass
 class eod_exit:
-    future_price: float = 0.0
     option_price: float = 0.0
+    timestamp: str = ""
 
     def to_row(self):
-        return [self.future_price, self.option_price]
+        return [self.timestamp, self.option_price]
 
 
 @dataclass
 class paper_trade_row:
     date: str = ""
-    future: str = ""
     option_name: str = ""
     trade_type: str = ""
 
@@ -49,7 +47,7 @@ class paper_trade_row:
     reclaim_candle: candle_snapshot = field(default_factory=candle_snapshot)
     confirm_candle: candle_snapshot = field(default_factory=candle_snapshot)
 
-    entry_future_price: float = 0.0
+    entry_trigger_price: float = 0.0
     entry_option_price: float = 0.0
     entry_timestamp: str = ""
 
@@ -62,13 +60,12 @@ class paper_trade_row:
     # Standard exits
     exit1_hit: exit_hit = field(default_factory=exit_hit)  # Length Of Piercing
     exit2_hit: exit_hit = field(default_factory=exit_hit)  # 2 x Length Of Piercing
-    exit3_hit: exit_hit = field(default_factory=exit_hit)  # 8 Points
-    # Exit-4 (Bollinger target) -- kept for the engine's hypothesis tracking
+    exit3_hit: exit_hit = field(default_factory=exit_hit)  # 7 Points
+    # Exit-5 (Bollinger upper band) -- the "Exit-5" sheet column
     exit4_hit: exit_hit = field(default_factory=exit_hit)
 
     # Multiple fixed-point exits (user listed several "Exit-4" variants)
     exit4_10_hit: exit_hit = field(default_factory=exit_hit)  # 10 Points
-    exit4_15_hit: exit_hit = field(default_factory=exit_hit)  # 15 Points
     exit4_20_hit: exit_hit = field(default_factory=exit_hit)  # 20 Points
     exit4_30_hit: exit_hit = field(default_factory=exit_hit)  # 30 Points
     exit4_40_hit: exit_hit = field(default_factory=exit_hit)  # 40 Points
@@ -94,20 +91,18 @@ class paper_trade_row:
         row += self.confirm_candle.to_row()
 
         # Entry and SL
-        row += [self.entry_timestamp]
-        row += [self.sl_low]
+        row += [self.entry_timestamp, self.entry_option_price]
+        row += self.sl_hit.to_row()
 
-        # Standard exit hits (each returns [future_price, option_price, timestamp])
+        # Standard exit hits (each returns [timestamp, option_price])
         row += self.exit1_hit.to_row()
         row += self.exit2_hit.to_row()
-        row += self.exit3_hit.to_row()
+        row += [self.exit3_hit.timestamp,
+            self.entry_option_price + 7.0 if self.exit3_hit.is_hit else 0.0]
 
-        # Bollinger / Exit-4 hypothesis
-        row += self.exit4_hit.to_row()
-
-        # Fixed-point exits
+        # Fixed-point exits, with Exit-5 (Bollinger) in the old 15-point slot
         row += self.exit4_10_hit.to_row()
-        row += self.exit4_15_hit.to_row()
+        row += self.exit4_hit.to_row()
         row += self.exit4_20_hit.to_row()
         row += self.exit4_30_hit.to_row()
         row += self.exit4_40_hit.to_row()

@@ -1,4 +1,4 @@
-# Run: python -m BusinessLogic.vwappiercing_options.tests.test_search_scrip --key <path> [--symbol NIFTY28JUL26F]
+# Run: python -m BusinessLogic.vwap_piercing_option_buy.tests.test_search_scrip --key <path> [--symbol NIFTY28JUL26F]
 # -*- coding: utf-8 -*-
 """
 test_search_scrip.py

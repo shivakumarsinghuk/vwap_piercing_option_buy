@@ -1,4 +1,4 @@
-# Run: python -m BusinessLogic.vwappiercing_options.tests.test_option_chain_quotes --key <path> [--strike 24600]
+# Run: python -m BusinessLogic.vwap_piercing_option_buy.tests.test_option_chain_quotes --key <path> [--strike 24600]
 # -*- coding: utf-8 -*-
 """
 test_option_chain_quotes.py
