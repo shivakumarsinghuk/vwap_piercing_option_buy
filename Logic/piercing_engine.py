@@ -351,7 +351,7 @@ class VwapPiercingEngine(ILogic):
                 elif ds.state == STATE_IN_TRADE:
                     self.__check_exit_hits_live(ds)
 
-            self.__advance_or_sleep(3)
+            self.__advance_or_sleep(12)
 
         for ds in self.directions.values():
             if ds.state == STATE_IN_TRADE:
