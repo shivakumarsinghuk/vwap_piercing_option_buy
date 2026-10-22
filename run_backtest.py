@@ -32,6 +32,7 @@ message rather than failing the whole run.
 """
 import argparse
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas_market_calendars as mcal
 
@@ -42,8 +43,10 @@ from BusinessLogic.vwap_piercing_option_buy.Logic.backtest_engine import run_bac
 from BrokerUtility.broker_platform.zebu.zebumynt_utility import zebumynt_utitlity
 from BrokerUtility.pal.utility_manager import *
 
+IST = ZoneInfo("Asia/Kolkata")
+
 def get_trading_days_lookback(lookback_days):
-    end_date = datetime.now().date() - timedelta(days=1)
+    end_date = datetime.now(IST).date() - timedelta(days=1)
     start_date = end_date - timedelta(days=lookback_days)
     return get_trading_days_between(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
 

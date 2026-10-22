@@ -45,7 +45,7 @@ def select_cheapest_in_band(chain_df, option_type, band_low=80.0, band_high=130.
     lowest-premium (cheapest) one among them. Returns (symbol, price), or (None, 0.0) if the
     chain is empty/missing or nothing in the band qualifies.
     """
-    if chain_df is None or len(chain_df) == 0:
+    if chain_df is None or not hasattr(chain_df, "columns") or len(chain_df) == 0:
         return None, 0.0
     if type_col not in chain_df.columns or ltp_col not in chain_df.columns or symbol_col not in chain_df.columns:
         return None, 0.0

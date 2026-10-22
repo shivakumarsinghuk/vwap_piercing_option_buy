@@ -29,8 +29,9 @@ force-closed at the prevailing price regardless of SL/Exit-1..4 state.
 import threading
 import time
 import traceback
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from enum import Enum
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -84,6 +85,9 @@ CHAIN_UNDERLYING_SYMBOL = {"NIFTY": "NIFTY50-INDEX", "BANKNIFTY": "NIFTYBANK-IND
 # BACKTEST-only historical option lookups are per-symbol calls (no batched chain-quote
 # equivalent exists for a past date) -- pace them to stay under the broker's rate limit.
 HISTORICAL_OPTION_LOOKUP_DELAY_SECONDS = 0.5
+OPTION_CHAIN_REFRESH_INTERVAL_SECONDS = 60
+OPTION_CHAIN_FAILURE_COOLDOWN_SECONDS = 300
+IST = ZoneInfo("Asia/Kolkata")
 
 # BACKTEST-only memo of the last strike successfully selected per (index_name, option_type),
 # kept at module scope (not per engine instance) because BACKTEST builds a fresh engine per
@@ -175,6 +179,7 @@ class VwapPiercingEngine(ILogic):
         self.directions = {self.trade_direction: _DirectionState(self.trade_direction)}
         self.last_candle_data = None  # main-interval candle series (with VWAP column)
         self.test_mode = False  # LIVE may switch this on from args (see __init_live)
+        self._option_chain_refresh_after = 0.0
 
         if mode == Mode.LIVE:
             self.__init_live(**kwargs)
@@ -205,7 +210,7 @@ class VwapPiercingEngine(ILogic):
         # today -- the clock starts at TEST_MODE_START_TIME on that date (see __now), and every
         # candle and price comes from that date's history rather than the live market.
         self.test_mode = bool(getattr(args, "test_mode", False))
-        self.session_date_str = args.date if self.test_mode else date.today().strftime("%Y-%m-%d")
+        self.session_date_str = args.date if self.test_mode else datetime.now(IST).date().strftime("%Y-%m-%d")
         # simulated test-mode clock (see __now / __advance_or_sleep)
         self.test_clock = datetime.strptime(f"{self.session_date_str} {TEST_MODE_START_TIME}",
                                             "%Y-%m-%d %H:%M:%S")
@@ -430,6 +435,10 @@ class VwapPiercingEngine(ILogic):
         """
         if self.test_mode or any(ds.state != STATE_SEEK_PIERCING for ds in self.directions.values()):
             return
+        now = time.monotonic()
+        if now < self._option_chain_refresh_after:
+            return
+        self._option_chain_refresh_after = now + OPTION_CHAIN_FAILURE_COOLDOWN_SECONDS
         try:
             symbol, price = self.__select_option_by_premium(self.trade_utility.get_broker_utility(),
                                                             self.option_type)
@@ -439,6 +448,7 @@ class VwapPiercingEngine(ILogic):
             return
         if not symbol:
             return
+        self._option_chain_refresh_after = time.monotonic() + OPTION_CHAIN_REFRESH_INTERVAL_SECONDS
         self.preselected_options[self.option_type] = (symbol, price)
         if symbol != self.signal_option_symbol:
             print(self.logic_name, f": signal option changed {self.signal_option_symbol or 'none'} -> {symbol} @ {price}")
@@ -721,7 +731,7 @@ class VwapPiercingEngine(ILogic):
               f"order_id={order_id!r}" if success else "")
         # one OrderLog row per attempt, success or failure -- a stuck exit shows up as repeated
         # FAILED rows until one goes through. Wall-clock time: this is when the real order was sent.
-        now = datetime.now()
+        now = datetime.now(IST)
         self.obj_order_log_writer.write_order(order_log_row(
             timestamp=now.strftime("%H:%M:%S"),
             date=now.strftime("%Y-%m-%d"),
@@ -895,7 +905,7 @@ class VwapPiercingEngine(ILogic):
     def __now(self):
         # LIVE clock: real time, or in test mode the simulated clock, which only moves when the
         # execute loop advances it (fast mode).
-        return self.test_clock if self.test_mode else datetime.now()
+        return self.test_clock if self.test_mode else datetime.now(IST).replace(tzinfo=None)
 
     def __advance_or_sleep(self, seconds):
         # end of an execute-loop pass: test mode (fast mode) jumps the simulated clock ahead
