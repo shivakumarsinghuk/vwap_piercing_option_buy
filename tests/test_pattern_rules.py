@@ -1,7 +1,7 @@
 import unittest
 
 from DataTypes.defines import CLOSE_PRICE, HIGH_PRICE, OPEN_PRICE, VWAP
-from BusinessLogic.vwap_piercing_option_buy.Logic.pattern_rules import piercing_direction
+from BusinessLogic.vwap_piercing_option_buy.Logic.pattern_rules import piercing_direction, time_of_day
 
 
 class PiercingDirectionTests(unittest.TestCase):
@@ -32,6 +32,12 @@ class PiercingDirectionTests(unittest.TestCase):
     def test_rejects_when_either_gap_is_below_one_point(self):
         row = self.candle(open_price=99.5, close_price=103, high_price=104)
         self.assertIsNone(piercing_direction(row))
+
+    def test_time_of_day_strips_timezone_and_fractional_seconds(self):
+        self.assertEqual(time_of_day("2026-10-22 09:16:15.123456+05:30"), "09:16:15")
+
+    def test_time_of_day_keeps_naive_timestamp_behavior(self):
+        self.assertEqual(time_of_day("2026-10-22 09:16:15"), "09:16:15")
 
 
 if __name__ == "__main__":

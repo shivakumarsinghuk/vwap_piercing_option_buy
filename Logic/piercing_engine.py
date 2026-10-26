@@ -817,14 +817,58 @@ class VwapPiercingEngine(ILogic):
             except Exception:
                 return None
 
+        get_listed_contracts = getattr(self.broker, "get_option_contracts", None)
+        if callable(get_listed_contracts):
+            contracts = get_listed_contracts(self.index_name, weekly_expiry, option_type)
+            if not contracts:
+                self.__log(f"[{ts}] No listed {option_type} contracts for expiry {weekly_expiry}")
+                return None, 0.0
+
+            strikes = [contract["strike_price"] for contract in contracts]
+            historical_center = getattr(self.broker, "get_historical_option_center", None)
+            center = historical_center(self.index_name, weekly_expiry, ts) if callable(historical_center) else None
+            if center is None:
+                center = _LAST_SELECTED_STRIKE.get((self.index_name, option_type)) or seed_from_chain()
+            if center is None:
+                center = strikes[len(strikes) // 2]
+            else:
+                center = min(strikes, key=lambda strike: abs(strike - center))
+            candidates = sorted(contracts, key=lambda contract: abs(contract["strike_price"] - center))[:41]
+            samples = []
+            best_contract = None
+            best_price = float("inf")
+            for contract in candidates:
+                price = self.__historical_option_close_near(contract["symbol"], ts)
+                samples.append((contract["strike_price"], price))
+                if price is not None and self.target_premium_low <= price <= self.target_premium_high:
+                    if price < best_price:
+                        best_contract = contract
+                        best_price = price
+
+            if best_contract is None:
+                sample_text = ", ".join(f"{strike}:{price}" for strike, price in samples[:5])
+                if len(samples) > 5:
+                    sample_text += ", ... " + ", ".join(f"{strike}:{price}" for strike, price in samples[-3:])
+                self.__log(f"[{ts}] No {option_type} option in the "
+                           f"{self.target_premium_low:.0f}-{self.target_premium_high:.0f} band for "
+                           f"expiry {weekly_expiry}; scanned listed strikes near {center}: "
+                           f"{sample_text or 'none'}")
+                return None, 0.0
+
+            selected_strike = best_contract["strike_price"]
+            _LAST_SELECTED_STRIKE[(self.index_name, option_type)] = selected_strike
+            return best_contract["symbol"], best_price
+
         def locate(start_strike):
             # Walk from start_strike toward the premium band using only the option's own
             # premium: a CE's premium falls as the strike rises, a PE's rises with it. Stops once
             # the premium is near the band -- the fine scan (+/-20 strikes) then picks the exact
             # cheapest in-band contract. Step halves whenever the walk overshoots and turns back.
             strike, step, direction = start_strike, 5 * self.strike_step, 0
+            samples = []
             for _ in range(40):
                 _, price = probe(strike)
+                samples.append((strike, price))
                 if price is not None and price > 0:
                     if self.target_premium_low / 2 <= price <= self.target_premium_high * 2:
                         return strike
@@ -838,6 +882,7 @@ class VwapPiercingEngine(ILogic):
                     # cheaper/OTM strikes until something prices
                     direction = 1 if option_type == "CE" else -1
                 strike += direction * step
+            self.__dict__["_last_option_locate_samples"] = samples
             return None
 
         key = (self.index_name, option_type)
@@ -851,9 +896,14 @@ class VwapPiercingEngine(ILogic):
         # doesn't cost a full 41-strike fine scan before the miss is noticed
         located = locate(center)
         if located is None:
+            samples = self.__dict__.get("_last_option_locate_samples", [])
+            sample_text = ", ".join(f"{strike}:{price}" for strike, price in samples[:5])
+            if len(samples) > 5:
+                sample_text += ", ... " + ", ".join(f"{strike}:{price}" for strike, price in samples[-3:])
             self.__log(f"[{ts}] No {option_type} option near the "
                       f"{self.target_premium_low:.0f}-{self.target_premium_high:.0f} band for "
-                      f"expiry {weekly_expiry} (likely delisted/no trading this day)")
+                      f"expiry {weekly_expiry} (likely delisted/no trading this day); "
+                      f"strike:close samples: {sample_text or 'none'}")
             return None, 0.0
         best_symbol, best_price, best_strike = fine_scan(located)
 
@@ -924,6 +974,10 @@ class VwapPiercingEngine(ILogic):
                                     f"{self.session_date_str} 15:30:00",
                                     interval=f"{interval_minutes}minute", all_data=True,
                                     market_type=self.__option_market_type())
+            if data is not None and len(data) and DATE_TIME in data.columns:
+                timestamps = pd.to_datetime(data[DATE_TIME])
+                if timestamps.dt.tz is not None:
+                    data[DATE_TIME] = timestamps.dt.tz_localize(None)
             self.test_symbol_candles[key] = data
             print(self.logic_name, f": TEST MODE -- loaded {0 if data is None else len(data)} "
                                    f"{interval_minutes}-min candles of {symbol}")
@@ -934,8 +988,7 @@ class VwapPiercingEngine(ILogic):
         # starting at T closes at T + interval), so the replay never sees later prices
         if day is None or len(day) == 0:
             return day
-        starts = pd.to_datetime(self.session_date_str + " "
-                                + day[DATE_TIME].astype(str).map(pattern_rules.time_of_day))
+        starts = pd.to_datetime(day[DATE_TIME]).dt.tz_localize(None)
         closes = starts + pd.Timedelta(minutes=interval_minutes)
         now = datetime.strptime(now_str, "%Y-%m-%d %H:%M:%S")
         return day[(closes <= now).values].reset_index(drop=True).copy()
