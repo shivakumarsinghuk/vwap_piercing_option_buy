@@ -463,6 +463,10 @@ class VwapPiercingEngine(ILogic):
             return
         ts = str(row[DATE_TIME])
         if self.__check_reclaim(ds, row, current_vwap, ts):
+            if not self.test_mode:
+                symbol = self.signal_option_symbol or self.preselected_options.get(self.option_type, (None, 0.0))[0]
+                if symbol:
+                    self.quotes_utility.reset_ltp_high_watermark(symbol)
             return
         # Not reclaimed yet -- keep waiting on subsequent 5-min candles rather than abandoning
         # after just one miss. The piercing candle stays the reference point.
@@ -483,13 +487,20 @@ class VwapPiercingEngine(ILogic):
         # Entry triggers when option LTP reaches the option piercing candle's extreme.
         if ds.piercing_candle is None:
             return
+        reclaim_start = datetime.strptime(
+            f"{self.session_date_str} {pattern_rules.time_of_day(str(ds.reclaim_candle[DATE_TIME]))}",
+            "%Y-%m-%d %H:%M:%S")
+        if self.__now() < reclaim_start + timedelta(minutes=5):
+            self.quotes_utility.reset_ltp_high_watermark(signal_symbol)
+            return
         piercing_high = float(ds.piercing_candle[HIGH_PRICE])
         piercing_low = float(ds.piercing_candle[LOW_PRICE])
         if not self.__has_acceptable_top_wick(self.last_candle_data.iloc[-1]):
             self.__log_once_per_candle(ds, f": [{now_str}] ({ds.direction}) waiting for entry: confirmation candle top wick exceeds body")
             return
         if ds.direction == "BUY":
-            triggered = ltp >= piercing_high
+            sampled_high = self.quotes_utility.get_ltp_high_watermark(signal_symbol)
+            triggered = max(ltp, sampled_high or ltp) >= piercing_high
         else:
             triggered = ltp <= piercing_low
         if triggered:
@@ -1315,6 +1326,10 @@ class VwapPiercingEngine(ILogic):
         ds.piercing_candle = row
         ds.state = STATE_SEEK_RECLAIM
         if self.mode == Mode.LIVE:
+            if not self.test_mode:
+                symbol = self.signal_option_symbol or self.preselected_options.get(self.option_type, (None, 0.0))[0]
+                if symbol:
+                    self.quotes_utility.reset_ltp_high_watermark(symbol)
             # NOTE: LIVE's original wording puts direction after "PIERCING" (unlike its own
             # "seeking piercing" line, and unlike BACKTEST's "(direction) PIERCING" below) --
             # preserved exactly as-is rather than unified, since this task is about sharing
