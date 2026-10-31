@@ -29,8 +29,9 @@ force-closed at the prevailing price regardless of SL/Exit-1..4 state.
 import threading
 import time
 import traceback
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from enum import Enum
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -84,6 +85,9 @@ CHAIN_UNDERLYING_SYMBOL = {"NIFTY": "NIFTY50-INDEX", "BANKNIFTY": "NIFTYBANK-IND
 # BACKTEST-only historical option lookups are per-symbol calls (no batched chain-quote
 # equivalent exists for a past date) -- pace them to stay under the broker's rate limit.
 HISTORICAL_OPTION_LOOKUP_DELAY_SECONDS = 0.5
+OPTION_CHAIN_REFRESH_INTERVAL_SECONDS = 60
+OPTION_CHAIN_FAILURE_COOLDOWN_SECONDS = 300
+IST = ZoneInfo("Asia/Kolkata")
 
 # BACKTEST-only memo of the last strike successfully selected per (index_name, option_type),
 # kept at module scope (not per engine instance) because BACKTEST builds a fresh engine per
@@ -175,6 +179,7 @@ class VwapPiercingEngine(ILogic):
         self.directions = {self.trade_direction: _DirectionState(self.trade_direction)}
         self.last_candle_data = None  # main-interval candle series (with VWAP column)
         self.test_mode = False  # LIVE may switch this on from args (see __init_live)
+        self._option_chain_refresh_after = 0.0
 
         if mode == Mode.LIVE:
             self.__init_live(**kwargs)
@@ -205,7 +210,7 @@ class VwapPiercingEngine(ILogic):
         # today -- the clock starts at TEST_MODE_START_TIME on that date (see __now), and every
         # candle and price comes from that date's history rather than the live market.
         self.test_mode = bool(getattr(args, "test_mode", False))
-        self.session_date_str = args.date if self.test_mode else date.today().strftime("%Y-%m-%d")
+        self.session_date_str = args.date if self.test_mode else datetime.now(IST).date().strftime("%Y-%m-%d")
         # simulated test-mode clock (see __now / __advance_or_sleep)
         self.test_clock = datetime.strptime(f"{self.session_date_str} {TEST_MODE_START_TIME}",
                                             "%Y-%m-%d %H:%M:%S")
@@ -325,7 +330,7 @@ class VwapPiercingEngine(ILogic):
         print(self.logic_name, ": Execution Started", self.execution_start_time)
         has_started = False
         piercing_window_announced = False
-
+        print(self.logic_name, ": Current time: ", datetime.now(IST).time())
         while not self.__is_time_reached(self.execution_stop_time):
             if not self.__is_time_reached(self.execution_start_time):
                 self.__advance_or_sleep(2)
@@ -351,7 +356,7 @@ class VwapPiercingEngine(ILogic):
                 elif ds.state == STATE_IN_TRADE:
                     self.__check_exit_hits_live(ds)
 
-            self.__advance_or_sleep(3)
+            self.__advance_or_sleep(12)
 
         for ds in self.directions.values():
             if ds.state == STATE_IN_TRADE:
@@ -430,6 +435,10 @@ class VwapPiercingEngine(ILogic):
         """
         if self.test_mode or any(ds.state != STATE_SEEK_PIERCING for ds in self.directions.values()):
             return
+        now = time.monotonic()
+        if now < self._option_chain_refresh_after:
+            return
+        self._option_chain_refresh_after = now + OPTION_CHAIN_FAILURE_COOLDOWN_SECONDS
         try:
             symbol, price = self.__select_option_by_premium(self.trade_utility.get_broker_utility(),
                                                             self.option_type)
@@ -439,6 +448,7 @@ class VwapPiercingEngine(ILogic):
             return
         if not symbol:
             return
+        self._option_chain_refresh_after = time.monotonic() + OPTION_CHAIN_REFRESH_INTERVAL_SECONDS
         self.preselected_options[self.option_type] = (symbol, price)
         if symbol != self.signal_option_symbol:
             print(self.logic_name, f": signal option changed {self.signal_option_symbol or 'none'} -> {symbol} @ {price}")
@@ -453,6 +463,10 @@ class VwapPiercingEngine(ILogic):
             return
         ts = str(row[DATE_TIME])
         if self.__check_reclaim(ds, row, current_vwap, ts):
+            if not self.test_mode:
+                symbol = self.signal_option_symbol or self.preselected_options.get(self.option_type, (None, 0.0))[0]
+                if symbol:
+                    self.quotes_utility.reset_ltp_high_watermark(symbol)
             return
         # Not reclaimed yet -- keep waiting on subsequent 5-min candles rather than abandoning
         # after just one miss. The piercing candle stays the reference point.
@@ -473,13 +487,20 @@ class VwapPiercingEngine(ILogic):
         # Entry triggers when option LTP reaches the option piercing candle's extreme.
         if ds.piercing_candle is None:
             return
+        reclaim_start = datetime.strptime(
+            f"{self.session_date_str} {pattern_rules.time_of_day(str(ds.reclaim_candle[DATE_TIME]))}",
+            "%Y-%m-%d %H:%M:%S")
+        if self.__now() < reclaim_start + timedelta(minutes=5):
+            self.quotes_utility.reset_ltp_high_watermark(signal_symbol)
+            return
         piercing_high = float(ds.piercing_candle[HIGH_PRICE])
         piercing_low = float(ds.piercing_candle[LOW_PRICE])
         if not self.__has_acceptable_top_wick(self.last_candle_data.iloc[-1]):
             self.__log_once_per_candle(ds, f": [{now_str}] ({ds.direction}) waiting for entry: confirmation candle top wick exceeds body")
             return
         if ds.direction == "BUY":
-            triggered = ltp >= piercing_high
+            sampled_high = self.quotes_utility.get_ltp_high_watermark(signal_symbol)
+            triggered = max(ltp, sampled_high or ltp) >= piercing_high
         else:
             triggered = ltp <= piercing_low
         if triggered:
@@ -721,7 +742,7 @@ class VwapPiercingEngine(ILogic):
               f"order_id={order_id!r}" if success else "")
         # one OrderLog row per attempt, success or failure -- a stuck exit shows up as repeated
         # FAILED rows until one goes through. Wall-clock time: this is when the real order was sent.
-        now = datetime.now()
+        now = datetime.now(IST)
         self.obj_order_log_writer.write_order(order_log_row(
             timestamp=now.strftime("%H:%M:%S"),
             date=now.strftime("%Y-%m-%d"),
@@ -807,14 +828,58 @@ class VwapPiercingEngine(ILogic):
             except Exception:
                 return None
 
+        get_listed_contracts = getattr(self.broker, "get_option_contracts", None)
+        if callable(get_listed_contracts):
+            contracts = get_listed_contracts(self.index_name, weekly_expiry, option_type)
+            if not contracts:
+                self.__log(f"[{ts}] No listed {option_type} contracts for expiry {weekly_expiry}")
+                return None, 0.0
+
+            strikes = [contract["strike_price"] for contract in contracts]
+            historical_center = getattr(self.broker, "get_historical_option_center", None)
+            center = historical_center(self.index_name, weekly_expiry, ts) if callable(historical_center) else None
+            if center is None:
+                center = _LAST_SELECTED_STRIKE.get((self.index_name, option_type)) or seed_from_chain()
+            if center is None:
+                center = strikes[len(strikes) // 2]
+            else:
+                center = min(strikes, key=lambda strike: abs(strike - center))
+            candidates = sorted(contracts, key=lambda contract: abs(contract["strike_price"] - center))[:41]
+            samples = []
+            best_contract = None
+            best_price = float("inf")
+            for contract in candidates:
+                price = self.__historical_option_close_near(contract["symbol"], ts)
+                samples.append((contract["strike_price"], price))
+                if price is not None and self.target_premium_low <= price <= self.target_premium_high:
+                    if price < best_price:
+                        best_contract = contract
+                        best_price = price
+
+            if best_contract is None:
+                sample_text = ", ".join(f"{strike}:{price}" for strike, price in samples[:5])
+                if len(samples) > 5:
+                    sample_text += ", ... " + ", ".join(f"{strike}:{price}" for strike, price in samples[-3:])
+                self.__log(f"[{ts}] No {option_type} option in the "
+                           f"{self.target_premium_low:.0f}-{self.target_premium_high:.0f} band for "
+                           f"expiry {weekly_expiry}; scanned listed strikes near {center}: "
+                           f"{sample_text or 'none'}")
+                return None, 0.0
+
+            selected_strike = best_contract["strike_price"]
+            _LAST_SELECTED_STRIKE[(self.index_name, option_type)] = selected_strike
+            return best_contract["symbol"], best_price
+
         def locate(start_strike):
             # Walk from start_strike toward the premium band using only the option's own
             # premium: a CE's premium falls as the strike rises, a PE's rises with it. Stops once
             # the premium is near the band -- the fine scan (+/-20 strikes) then picks the exact
             # cheapest in-band contract. Step halves whenever the walk overshoots and turns back.
             strike, step, direction = start_strike, 5 * self.strike_step, 0
+            samples = []
             for _ in range(40):
                 _, price = probe(strike)
+                samples.append((strike, price))
                 if price is not None and price > 0:
                     if self.target_premium_low / 2 <= price <= self.target_premium_high * 2:
                         return strike
@@ -828,6 +893,7 @@ class VwapPiercingEngine(ILogic):
                     # cheaper/OTM strikes until something prices
                     direction = 1 if option_type == "CE" else -1
                 strike += direction * step
+            self.__dict__["_last_option_locate_samples"] = samples
             return None
 
         key = (self.index_name, option_type)
@@ -841,9 +907,14 @@ class VwapPiercingEngine(ILogic):
         # doesn't cost a full 41-strike fine scan before the miss is noticed
         located = locate(center)
         if located is None:
+            samples = self.__dict__.get("_last_option_locate_samples", [])
+            sample_text = ", ".join(f"{strike}:{price}" for strike, price in samples[:5])
+            if len(samples) > 5:
+                sample_text += ", ... " + ", ".join(f"{strike}:{price}" for strike, price in samples[-3:])
             self.__log(f"[{ts}] No {option_type} option near the "
                       f"{self.target_premium_low:.0f}-{self.target_premium_high:.0f} band for "
-                      f"expiry {weekly_expiry} (likely delisted/no trading this day)")
+                      f"expiry {weekly_expiry} (likely delisted/no trading this day); "
+                      f"strike:close samples: {sample_text or 'none'}")
             return None, 0.0
         best_symbol, best_price, best_strike = fine_scan(located)
 
@@ -890,12 +961,13 @@ class VwapPiercingEngine(ILogic):
 
     def __is_time_reached(self, str_time):
         target_time = datetime.strptime(str_time, "%H:%M:%S").time()
-        return self.__now().time() >= target_time
+        current_time = self.test_clock.time() if self.test_mode else datetime.now(IST).time()
+        return current_time >= target_time
 
     def __now(self):
         # LIVE clock: real time, or in test mode the simulated clock, which only moves when the
         # execute loop advances it (fast mode).
-        return self.test_clock if self.test_mode else datetime.now()
+        return self.test_clock if self.test_mode else datetime.now(IST).replace(tzinfo=None)
 
     def __advance_or_sleep(self, seconds):
         # end of an execute-loop pass: test mode (fast mode) jumps the simulated clock ahead
@@ -913,6 +985,10 @@ class VwapPiercingEngine(ILogic):
                                     f"{self.session_date_str} 15:30:00",
                                     interval=f"{interval_minutes}minute", all_data=True,
                                     market_type=self.__option_market_type())
+            if data is not None and len(data) and DATE_TIME in data.columns:
+                timestamps = pd.to_datetime(data[DATE_TIME])
+                if timestamps.dt.tz is not None:
+                    data[DATE_TIME] = timestamps.dt.tz_localize(None)
             self.test_symbol_candles[key] = data
             print(self.logic_name, f": TEST MODE -- loaded {0 if data is None else len(data)} "
                                    f"{interval_minutes}-min candles of {symbol}")
@@ -923,8 +999,7 @@ class VwapPiercingEngine(ILogic):
         # starting at T closes at T + interval), so the replay never sees later prices
         if day is None or len(day) == 0:
             return day
-        starts = pd.to_datetime(self.session_date_str + " "
-                                + day[DATE_TIME].astype(str).map(pattern_rules.time_of_day))
+        starts = pd.to_datetime(day[DATE_TIME]).dt.tz_localize(None)
         closes = starts + pd.Timedelta(minutes=interval_minutes)
         now = datetime.strptime(now_str, "%Y-%m-%d %H:%M:%S")
         return day[(closes <= now).values].reset_index(drop=True).copy()
@@ -1251,6 +1326,10 @@ class VwapPiercingEngine(ILogic):
         ds.piercing_candle = row
         ds.state = STATE_SEEK_RECLAIM
         if self.mode == Mode.LIVE:
+            if not self.test_mode:
+                symbol = self.signal_option_symbol or self.preselected_options.get(self.option_type, (None, 0.0))[0]
+                if symbol:
+                    self.quotes_utility.reset_ltp_high_watermark(symbol)
             # NOTE: LIVE's original wording puts direction after "PIERCING" (unlike its own
             # "seeking piercing" line, and unlike BACKTEST's "(direction) PIERCING" below) --
             # preserved exactly as-is rather than unified, since this task is about sharing

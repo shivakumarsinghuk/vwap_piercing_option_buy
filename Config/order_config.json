@@ -3,7 +3,7 @@
   "place_order": true,
 
   "_comment_place_order_in_test_mode": "LIVE test mode runs (--test_mode true --date ...) only, independent of place_order. true: send real orders for the replay's entries/exits.",
-  "place_order_in_test_mode": true,
+  "place_order_in_test_mode": false,
 
   "_comment_order_type": "Order type for both the BUY (entry) and SELL (exit) orders: \"MARKET\" or \"LIMIT\".",
   "order_type": "MARKET",
