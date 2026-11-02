@@ -1,6 +1,6 @@
 {
   "_comment_place_order": "Normal LIVE runs. true: BUY the traded option on entry and SELL it on exit (SL, 14:50 force exit, end of day, executor stop) through the broker utility. false: paper-trade only, no orders. Never applies to BACKTEST.",
-  "place_order": true,
+  "place_order": false,
 
   "_comment_place_order_in_test_mode": "LIVE test mode runs (--test_mode true --date ...) only, independent of place_order. true: send real orders for the replay's entries/exits.",
   "place_order_in_test_mode": false,
@@ -18,7 +18,7 @@
   "lot_count": 1,
 
   "_comment_order_route": "How orders are sent. \"api\": Fyers API via the broker utility (needs the whitelisted static IP). \"webhook\": POST to the FYERS Automate webhook URL in Config/webhook_url.txt (gitignored -- anyone with that URL can trigger orders).",
-  "order_route": "webhook",
+  "order_route": "",
 
   "_comment_webhook_payload": "webhook only: the JSON body sent per order. MUST match the message your FYERS Automate strategy expects -- this one is a placeholder. Placeholders: {symbol}, {fyers_symbol}, {transaction_type}, {side}, {quantity}, {order_type}, {product}, {price}, {reference_price}, {option_type}, {reason}.",
   "webhook_payload": {
