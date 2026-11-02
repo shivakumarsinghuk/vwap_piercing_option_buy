@@ -304,7 +304,7 @@ class VwapPiercingEngine(ILogic):
         # Pre-select cheapest CE and PE in the target premium band using option chain
         try:
             underlying = CHAIN_UNDERLYING_SYMBOL.get(self.index_name, self.index_name)
-            chain_df, _, _ = broker.getOptionChain(underlying)
+            chain_df, _, _ = self.quotes_utility.get_option_chain_snapshot(underlying)
             ce_sym, ce_price = select_cheapest_in_band(chain_df, "CE", self.target_premium_low, self.target_premium_high)
             pe_sym, pe_price = select_cheapest_in_band(chain_df, "PE", self.target_premium_low, self.target_premium_high)
             # fetchOHLC/get_quotes add the exchange themselves -- keep symbols bare, or Fyers is
@@ -314,16 +314,58 @@ class VwapPiercingEngine(ILogic):
             if pe_sym:
                 self.preselected_options["PE"] = (pe_sym.split(":")[-1], pe_price)
             self.signal_option_symbol = self.preselected_options.get(self.option_type, (None, 0.0))[0]
-            # ensure quotes utility is subscribed to option quotes for live monitoring
-            option_symbols = [s for s, p in self.preselected_options.values() if s]
+            option_prices = self.__nearest_option_chain_contracts(chain_df, contracts_per_side=40)
+            for symbol, price in self.preselected_options.values():
+                if symbol and price > 0:
+                    option_prices.setdefault(symbol, price)
+            option_symbols = list(option_prices)
+            market_types = [self.__option_market_type()] * len(option_symbols)
             if option_symbols:
-                self.quotes_utility.add_stocks(option_symbols, [self.__option_market_type()] * len(option_symbols))
+                self.quotes_utility.add_stocks(
+                    option_symbols, market_types, p_initial_prices=option_prices)
+            print(self.logic_name, f": Subscribed option chain contracts CE={self.startup_option_counts['CE']} "
+                  f"PE={self.startup_option_counts['PE']}")
             print(self.logic_name, ": Preselected options CE/PE:", self.preselected_options)
         except Exception:
             # non-fatal: fall back to selecting at entry time as before
             print(self.logic_name, ": Option chain lookup failed; will select at entry time")
         self.pre_requisite_complete_event.set()
         print(self.logic_name, ": Exiting pre-requisite thread")
+
+    def __nearest_option_chain_contracts(self, chain_df, contracts_per_side=40):
+        required_columns = {"symbol", "option_type", "ltp", "strike_price"}
+        self.startup_option_counts = {"CE": 0, "PE": 0}
+        if chain_df is None or chain_df.empty or not required_columns.issubset(chain_df.columns):
+            print(self.logic_name, ": Option chain is missing symbol/type/ltp/strike fields")
+            return {}
+
+        underlying_rows = chain_df.loc[chain_df["option_type"].fillna("") == ""]
+        if underlying_rows.empty:
+            spot_prices = pd.to_numeric(chain_df["strike_price"], errors="coerce").dropna()
+            if spot_prices.empty:
+                return {}
+            spot_price = spot_prices.median()
+        else:
+            spot_prices = pd.to_numeric(underlying_rows["ltp"], errors="coerce").dropna()
+            if spot_prices.empty:
+                return {}
+            spot_price = spot_prices.iloc[0]
+
+        option_prices = {}
+        for option_type in ("CE", "PE"):
+            candidates = chain_df.loc[chain_df["option_type"] == option_type].copy()
+            candidates["ltp"] = pd.to_numeric(candidates["ltp"], errors="coerce")
+            candidates["strike_price"] = pd.to_numeric(candidates["strike_price"], errors="coerce")
+            candidates = candidates.dropna(subset=["symbol", "ltp", "strike_price"])
+            candidates = candidates.loc[
+                (candidates["ltp"] > 0) & (candidates["symbol"].astype(str) != "")]
+            candidates["_atm_distance"] = (candidates["strike_price"] - float(spot_price)).abs()
+            candidates = candidates.sort_values(["_atm_distance", "strike_price"], kind="mergesort")
+            for _, contract in candidates.head(contracts_per_side).iterrows():
+                symbol = str(contract["symbol"]).split(":")[-1]
+                option_prices[symbol] = float(contract["ltp"])
+                self.startup_option_counts[option_type] += 1
+        return option_prices
 
     def execute(self):
         self.pre_requisite_complete_event.wait()
@@ -1008,12 +1050,10 @@ class VwapPiercingEngine(ILogic):
         # Normal LIVE: ask the broker for today's candles up to now. Test mode: no broker call --
         # the test day's candles (fetched once) that have closed by the simulated time.
         if not self.test_mode:
-            # Fyers ignores the time-of-day in the range and returns the whole day so far,
-            # INCLUDING the candle still forming -- drop it, or its cursor would move past that
-            # candle after seeing only its first few seconds and never check it once closed.
-            data = broker.fetchOHLC(symbol, str_from_date, now_str,
-                                    interval=f"{interval_minutes}minute", all_data=True,
-                                    market_type=self.__option_market_type())
+            data = self.quotes_utility.fetchOHLC(
+                symbol, str_from_date, now_str,
+                interval=f"{interval_minutes}minute", all_data=True,
+                market_type=self.__option_market_type())
             return self.__closed_by(data, interval_minutes, now_str)
         return self.__closed_by(self.__test_day_series(broker, symbol, interval_minutes),
                                 interval_minutes, now_str)
