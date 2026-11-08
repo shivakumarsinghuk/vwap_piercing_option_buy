@@ -12,7 +12,7 @@
   "entry_stop_limit_offset": 0.5,
 
   "_comment_target_exit": "Resting SELL limit target after entry fills. Supported values: EXIT1, EXIT2, EXIT3, EXIT4_10, EXIT4_20, EXIT4_30, EXIT4_40.",
-  "target_exit": "EXIT4",
+  "target_exit": "EXIT4_20",
 
   "_comment_limit_buffer_percent": "LIMIT only: BUY price = reference price + buffer%, SELL price = reference price - buffer%, rounded to tick_size. The reference price is the option's LTP at the signal.",
   "limit_buffer_percent": 1.0,
