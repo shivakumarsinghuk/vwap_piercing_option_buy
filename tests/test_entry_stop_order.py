@@ -300,6 +300,36 @@ class EntryStopOrderTests(unittest.TestCase):
         self.assertEqual(ds.current_trade.exit1_hit.option_price, 110.0)
         self.assertFalse(ds.current_trade.sl_hit.is_hit)
 
+    def test_fixed_point_targets_are_recorded_before_configured_target_closes_trade(self):
+        self.engine.order_cfg = {"target_exit": "EXIT1"}
+        self.engine.mode = Mode.BACKTEST
+        self.engine._VwapPiercingEngine__update_mae_mfe_range = Mock()
+        ds = _DirectionState("BUY")
+        ds.current_trade = paper_trade_row()
+        ds.current_trade.entry_option_price = 132.0
+        ds.sl_level = 100.0
+        ds.exit1_level = 154.25
+        ds.exit4_10_level = 142.0
+        ds.exit4_20_level = 152.0
+        bar = {
+            DATE_TIME: "2026-11-05 11:31:00",
+            OPEN_PRICE: 132.0,
+            HIGH_PRICE: 154.25,
+            LOW_PRICE: 130.0,
+            CLOSE_PRICE: 135.0,
+        }
+
+        outcome = self.engine._VwapPiercingEngine__in_trade_minute(ds, bar)
+
+        self.assertEqual(outcome, "TARGET")
+        self.assertTrue(ds.current_trade.exit1_hit.is_hit)
+        self.assertTrue(ds.current_trade.exit4_10_hit.is_hit)
+        self.assertEqual(ds.current_trade.exit4_10_hit.timestamp, bar[DATE_TIME])
+        self.assertEqual(ds.current_trade.exit4_10_hit.option_price, 142.0)
+        self.assertTrue(ds.current_trade.exit4_20_hit.is_hit)
+        self.assertEqual(ds.current_trade.exit4_20_hit.timestamp, bar[DATE_TIME])
+        self.assertEqual(ds.current_trade.exit4_20_hit.option_price, 152.0)
+
     def test_backtest_uses_open_price_for_target_gap(self):
         ds, outcome = self._minute_exit_case(open_price=112.0, high=115.0, low=111.0, close=113.0)
 

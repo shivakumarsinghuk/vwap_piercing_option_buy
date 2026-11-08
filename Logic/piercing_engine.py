@@ -2259,6 +2259,14 @@ class VwapPiercingEngine(ILogic):
             trade.sl_hit.is_hit = True
             return "SL"
 
+        # Fixed-point exits are reporting hypotheses, even when the configured target closes
+        # the replay on this same candle. Use High because these levels are intrabar targets.
+        for hit_obj, level in ((trade.exit4_10_hit, ds.exit4_10_level),
+                               (trade.exit4_20_hit, ds.exit4_20_level),
+                               (trade.exit4_30_hit, ds.exit4_30_level),
+                               (trade.exit4_40_hit, ds.exit4_40_level)):
+            self.__mark_exit_if_hit_point(hit_obj, level, high, ts, record_target_price=True)
+
         _, (target_level, target_hit) = self.__configured_target_exit(ds)
         if target_level > 0 and high >= target_level:
             target_hit.option_price = max(open_price, target_level)
@@ -2273,10 +2281,6 @@ class VwapPiercingEngine(ILogic):
         # Exit-5 (Bollinger) moves every candle, so it records the actual close that crossed it
         self.__mark_exit_if_hit_point(trade.exit4_hit, self.__bollinger_exit_level(ds, self.__candle_start(bar)) or 0.0,
                                       close, ts)
-        for hit_obj, level in ((trade.exit4_10_hit, ds.exit4_10_level),
-                               (trade.exit4_20_hit, ds.exit4_20_level), (trade.exit4_30_hit, ds.exit4_30_level),
-                               (trade.exit4_40_hit, ds.exit4_40_level)):
-            self.__mark_exit_if_hit_point(hit_obj, level, close, ts, record_target_price=True)
         self.__log_exit_breaches(ds, was_hit)
         return "SL" if trade.sl_hit.is_hit else None
 
