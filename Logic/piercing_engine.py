@@ -26,6 +26,7 @@ Bollinger) are all parallel hypotheses tracked for comparison only; breaching
 one is logged but doesn't close the trade. Any trade still open at 14:50 is
 force-closed at the prevailing price regardless of SL/Exit-1..4 state.
 """
+import math
 import threading
 import time
 import traceback
@@ -117,6 +118,19 @@ class _DirectionState:
 
         self.current_trade: paper_trade_row = None
         self.option_symbol = ""
+        self.entry_order_id = ""
+        self.entry_order_symbol = ""
+        self.entry_order_required = False
+        self.entry_order_limit_price = 0.0
+        self.entry_order_last_status = ""
+        self.exit_order_id = ""
+        self.exit_order_limit_price = 0.0
+        self.exit_order_is_market = False
+        self.exit_order_reason = ""
+        self.exit_order_last_status = ""
+        self.exit_order_filled_quantity = 0
+        self.exit_order_quantity = 0
+        self.exit_order_filled = False
         # LIVE only: quantity of the real BUY placed for this position (0 = no real position,
         # so no SELL is sent on exit).
         self.order_quantity = 0
@@ -166,19 +180,21 @@ class VwapPiercingEngine(ILogic):
         # strategy constants
         self.index_name = "NIFTY"
         self.strike_step = 50
-        self.target_premium_low = 80.0
-        self.target_premium_high = 130.0
+        self.target_premium_low = 100.0
+        self.target_premium_high = 150.0
         self.bollinger_period = BOLLINGER_PERIOD
         self.bollinger_std_dev = BOLLINGER_STD_DEV
 
         # Each option type runs the BUY pattern independently; CE and PE are separate
         # instruments, but neither is treated as a SELL strategy.
         self.signal_option_symbol = ""
+        self.test_option_symbol = None
         # Preselected cheapest options for runtime (CE and PE)
         self.preselected_options = {"CE": (None, 0.0), "PE": (None, 0.0)}
         self.directions = {self.trade_direction: _DirectionState(self.trade_direction)}
         self.last_candle_data = None  # main-interval candle series (with VWAP column)
         self.test_mode = False  # LIVE may switch this on from args (see __init_live)
+        self.test_option_selection_ready = True
         self._option_chain_refresh_after = 0.0
 
         if mode == Mode.LIVE:
@@ -210,6 +226,11 @@ class VwapPiercingEngine(ILogic):
         # today -- the clock starts at TEST_MODE_START_TIME on that date (see __now), and every
         # candle and price comes from that date's history rather than the live market.
         self.test_mode = bool(getattr(args, "test_mode", False))
+        requested_test_option_symbol = getattr(args, "test_option_symbol", None)
+        if self.test_mode and requested_test_option_symbol \
+                and requested_test_option_symbol.endswith(self.option_type):
+            self.test_option_symbol = requested_test_option_symbol
+        self.test_option_selection_ready = not self.test_mode
         self.session_date_str = args.date if self.test_mode else datetime.now(IST).date().strftime("%Y-%m-%d")
         # simulated test-mode clock (see __now / __advance_or_sleep)
         self.test_clock = datetime.strptime(f"{self.session_date_str} {TEST_MODE_START_TIME}",
@@ -254,6 +275,7 @@ class VwapPiercingEngine(ILogic):
         # old option's series would point at the wrong candle in the new one's.
         self.last_processed_candle_ts = None
         self.last_processed_candle_ts_5min = None
+        self.last_test_option_refresh_ts = None
 
         self.pre_requisite_thread = threading.Thread(target=self.pre_requisite_thread_handler)
         self.execute_thread = threading.Thread(target=self.execute)
@@ -286,17 +308,33 @@ class VwapPiercingEngine(ILogic):
         broker = self.trade_utility.get_broker_utility()
 
         if self.test_mode:
-            # today's live chain says nothing about the test date -- pick the cheapest in-band
-            # option from that date's own premiums at the simulated start time instead, and
-            # load its candles once up front.
+            # Today's live chain says nothing about the test date. Start with the historical
+            # in-band option when available; otherwise load a nearby listed contract only to
+            # bootstrap candle data while waiting for the historical selection to enter band.
             start_ts = f"{self.session_date_str} {TEST_MODE_START_TIME}"
-            symbol, price = self.__select_historical_option(self.option_type, start_ts)
-            if symbol:
+            if self.test_option_symbol:
+                symbol, price = self.test_option_symbol, 0.0
+                self.test_option_selection_ready = True
                 self.preselected_options[self.option_type] = (symbol, price)
+                print(self.logic_name, ": TEST MODE -- pinned option:", symbol)
+            else:
+                symbol, price = self.__select_historical_option(self.option_type, start_ts)
+                self.test_option_selection_ready = bool(symbol)
+                if not symbol:
+                    symbol = self.__historical_option_bootstrap(self.option_type, start_ts)
+                    if symbol:
+                        print(self.logic_name, ": TEST MODE -- no in-band option at startup; "
+                              "bootstrapping candle data from", symbol,
+                              "and waiting for an in-band historical selection")
+            if symbol:
+                if self.test_option_selection_ready:
+                    self.preselected_options[self.option_type] = (symbol, price)
                 self.signal_option_symbol = symbol
                 for interval_minutes in sorted({self.candle_interval_minutes, 5, 1}):
                     self.__test_day_series(broker, symbol, interval_minutes)
-            print(self.logic_name, ": TEST MODE -- selected option:", self.preselected_options[self.option_type])
+            selected_option = self.preselected_options.get(self.option_type, (None, 0.0))
+            print(self.logic_name, ": TEST MODE -- selected option:",
+                  selected_option if selected_option[0] else (symbol, price))
             self.pre_requisite_complete_event.set()
             print(self.logic_name, ": Exiting pre-requisite thread")
             return
@@ -390,11 +428,16 @@ class VwapPiercingEngine(ILogic):
             self.__process_new_candles_live(now_str)
 
             for ds in self.directions.values():
+                pending_entry_checked = False
+                if ds.state == STATE_SEEK_CONFIRM_ENTRY and ds.entry_order_id:
+                    self.__check_entry_trigger_live(ds)
+                    pending_entry_checked = True
                 if ds.state in (STATE_SEEK_RECLAIM, STATE_SEEK_CONFIRM_ENTRY) \
                         and self.__check_abandon_incomplete_setup(ds, now_str):
                     continue
                 if ds.state == STATE_SEEK_CONFIRM_ENTRY:
-                    self.__check_entry_trigger_live(ds)
+                    if not pending_entry_checked:
+                        self.__check_entry_trigger_live(ds)
                 elif ds.state == STATE_IN_TRADE:
                     self.__check_exit_hits_live(ds)
 
@@ -403,6 +446,10 @@ class VwapPiercingEngine(ILogic):
         for ds in self.directions.values():
             if ds.state == STATE_IN_TRADE:
                 self.__finalize_trade_at_eod_live(ds)
+            elif ds.entry_order_id:
+                self.__cancel_pending_entry_order(ds)
+                if ds.state == STATE_IN_TRADE:
+                    self.__finalize_trade_at_eod_live(ds)
 
         print(self.logic_name, ": Execution loop ended")
 
@@ -443,6 +490,8 @@ class VwapPiercingEngine(ILogic):
             new_rows = self.__rows_after(candle_data, self.last_processed_candle_ts)
             for _, row in new_rows.iterrows():
                 for ds in self.directions.values():
+                    if self.test_mode and not self.test_option_selection_ready:
+                        continue
                     if ds.state == STATE_SEEK_PIERCING:
                         ts = str(row[DATE_TIME])
                         self.__check_seek_piercing(ds, row, ts)
@@ -456,6 +505,8 @@ class VwapPiercingEngine(ILogic):
             new_rows_5min = self.__rows_after(candle_data_5min, self.last_processed_candle_ts_5min)
             for _, row in new_rows_5min.iterrows():
                 for ds in self.directions.values():
+                    if self.test_mode and not self.test_option_selection_ready:
+                        continue
                     if ds.state == STATE_SEEK_RECLAIM:
                         self.__on_reclaim_5min_close_live(ds, row)
 
@@ -475,7 +526,21 @@ class VwapPiercingEngine(ILogic):
         was at start-up. Once a piercing forms, the option is frozen until the setup/trade ends.
         On any failure the current option is kept.
         """
-        if self.test_mode or any(ds.state != STATE_SEEK_PIERCING for ds in self.directions.values()):
+        if self.test_mode:
+            if self.test_option_symbol:
+                return
+            if self.last_candle_data is None or len(self.last_candle_data) == 0 \
+                    or any(ds.state != STATE_SEEK_PIERCING for ds in self.directions.values()):
+                return
+            latest_start = self.__candle_start(self.last_candle_data.iloc[-1])
+            refresh_ts = latest_start + timedelta(minutes=self.candle_interval_minutes - 1)
+            refresh_ts_str = refresh_ts.strftime("%Y-%m-%d %H:%M:%S")
+            if refresh_ts_str == self.last_test_option_refresh_ts:
+                return
+            self.last_test_option_refresh_ts = refresh_ts_str
+            self.__refresh_signal_option_backtest(refresh_ts_str)
+            return
+        if any(ds.state != STATE_SEEK_PIERCING for ds in self.directions.values()):
             return
         now = time.monotonic()
         if now < self._option_chain_refresh_after:
@@ -515,6 +580,9 @@ class VwapPiercingEngine(ILogic):
         print(self.logic_name, f": [{ts}] ({ds.direction}) no reclaim yet, still waiting {self.__fmt_candle(row, current_vwap)}")
 
     def __check_entry_trigger_live(self, ds: _DirectionState):
+        if ds.entry_order_required:
+            self.__check_pending_entry_order(ds)
+            return
         if self.test_mode:
             self.__check_entry_trigger_test(ds)
             return
@@ -574,9 +642,234 @@ class VwapPiercingEngine(ILogic):
             ds.last_logged_candle_ts = candle_ts
         print(self.logic_name, message)
 
+    def __configured_target_exit(self, ds: _DirectionState):
+        target_name = self.order_cfg["target_exit"]
+        targets = {
+            "EXIT1": (ds.exit1_level, ds.current_trade.exit1_hit),
+            "EXIT2": (ds.exit2_level, ds.current_trade.exit2_hit),
+            "EXIT3": (ds.exit3_level, ds.current_trade.exit3_hit),
+            "EXIT4_10": (ds.exit4_10_level, ds.current_trade.exit4_10_hit),
+            "EXIT4_20": (ds.exit4_20_level, ds.current_trade.exit4_20_hit),
+            "EXIT4_30": (ds.exit4_30_level, ds.current_trade.exit4_30_hit),
+            "EXIT4_40": (ds.exit4_40_level, ds.current_trade.exit4_40_hit),
+        }
+        return target_name, targets[target_name]
+
+    def __round_up_to_tick(self, price):
+        tick_size = float(self.order_cfg["tick_size"])
+        if not math.isfinite(tick_size) or tick_size <= 0:
+            raise ValueError("tick_size must be positive")
+        return round(math.ceil((price / tick_size) - 1e-12) * tick_size, 2)
+
+    def __place_target_exit_order(self, ds: _DirectionState):
+        if ds.exit_order_id or ds.order_quantity <= 0 or not self.place_orders or self.test_mode:
+            return bool(ds.exit_order_id)
+        target_name, (target_price, _) = self.__configured_target_exit(ds)
+        if target_price <= 0:
+            print(self.logic_name, f": ({ds.direction}) Invalid {target_name} target price; "
+                  "target exit order was not sent")
+            return False
+        target_price = self.__round_up_to_tick(target_price)
+        placed, order_id = self.__place_real_order(
+            ds.option_symbol, "SELL", ds.order_quantity, target_price,
+            f"Target {target_name}", order_type="LIMIT", price_override=target_price,
+            return_order_id=True)
+        if not placed:
+            return False
+        ds.exit_order_id = order_id
+        ds.exit_order_limit_price = target_price
+        ds.exit_order_is_market = False
+        ds.exit_order_reason = "Target"
+        ds.exit_order_last_status = "PLACED"
+        ds.exit_order_filled_quantity = 0
+        ds.exit_order_quantity = ds.order_quantity
+        print(self.logic_name, f": ({ds.direction}) target exit submitted: {target_name} "
+              f"limit={target_price} quantity={ds.order_quantity} order_id={order_id}")
+        return True
+
+    def __clear_exit_order(self, ds: _DirectionState):
+        ds.exit_order_id = ""
+        ds.exit_order_limit_price = 0.0
+        ds.exit_order_is_market = False
+        ds.exit_order_reason = ""
+        ds.exit_order_last_status = ""
+        ds.exit_order_filled_quantity = 0
+        ds.exit_order_quantity = 0
+
+    def __log_exit_order_modification(self, ds: _DirectionState, order_id, reason, success):
+        now = datetime.now(IST)
+        reference_price = ds.current_trade.sl_hit.option_price if reason == "SL" \
+            else ds.current_trade.exit5_eod.option_price
+        self.obj_order_log_writer.write_order(order_log_row(
+            timestamp=now.strftime("%H:%M:%S"),
+            date=now.strftime("%Y-%m-%d"),
+            option_name=ds.option_symbol,
+            option_type=self.option_type,
+            order_type="Exit",
+            transaction_type="SELL",
+            quantity=ds.order_quantity,
+            price_type="MARKET",
+            limit_price=0.0,
+            order_id=order_id,
+            status="PLACED" if success else "FAILED",
+            reason=f"{reason} (modify exit order to MARKET)",
+            reference_price=reference_price,
+        ))
+
+    def __apply_exit_order_fill(self, ds: _DirectionState, order_info, complete=False):
+        filled = int(getattr(order_info, "filled_quantity", 0) or 0)
+        if complete and filled <= 0:
+            filled = ds.exit_order_quantity
+        filled = max(ds.exit_order_filled_quantity, filled)
+        newly_filled = filled - ds.exit_order_filled_quantity
+        if newly_filled > 0:
+            ds.order_quantity = max(0, ds.order_quantity - newly_filled)
+            ds.exit_order_filled_quantity = filled
+
+    def __record_exit_order_fill(self, ds: _DirectionState, order_info):
+        reason = ds.exit_order_reason or "Target"
+        fill_price = float(getattr(order_info, "average_price", 0.0) or 0.0)
+        if fill_price <= 0:
+            fill_price = float(getattr(order_info, "price", 0.0) or 0.0)
+        if fill_price <= 0:
+            if reason == "SL":
+                fill_price = ds.current_trade.sl_hit.option_price
+            elif reason == "Target":
+                fill_price = ds.exit_order_limit_price
+            else:
+                fill_price = ds.current_trade.exit5_eod.option_price
+        timestamp = self.__now().strftime("%H:%M:%S")
+        if reason == "Target":
+            _, (_, hit_obj) = self.__configured_target_exit(ds)
+            hit_obj.option_price = fill_price
+            hit_obj.timestamp = timestamp
+            hit_obj.is_hit = True
+        elif reason == "SL":
+            ds.current_trade.sl_hit.option_price = fill_price
+            ds.current_trade.sl_hit.timestamp = timestamp
+            ds.current_trade.sl_hit.is_hit = True
+        else:
+            ds.current_trade.exit5_eod.option_price = fill_price
+            ds.current_trade.exit5_eod.timestamp = timestamp
+        ds.exit_order_filled = True
+        self.__stamp_mae_mfe(ds)
+        self.__finalize_and_reset_live(ds, reason)
+
+    def __check_pending_exit_order(self, ds: _DirectionState):
+        if not ds.exit_order_id:
+            return False
+        broker = self.trade_utility.get_broker_utility()
+        try:
+            order_info = broker.getOrderInfoByOrderId(ds.exit_order_id)
+        except Exception:
+            print(self.logic_name, f": ({ds.direction}) Failed checking exit order "
+                  f"{ds.exit_order_id}; will retry")
+            traceback.print_exc()
+            return True
+        status = self.__normalized_order_status(order_info)
+        self.__apply_exit_order_fill(ds, order_info, complete=status == "complete")
+        if status == "complete":
+            if ds.order_quantity == 0:
+                self.__record_exit_order_fill(ds, order_info)
+                return True
+            reason = ds.exit_order_reason
+            print(self.logic_name, f": ({ds.direction}) Exit order {ds.exit_order_id} completed "
+                  f"with {ds.order_quantity} remaining; submitting an order for the remainder")
+            self.__clear_exit_order(ds)
+            if reason and reason != "Target":
+                self.__request_market_exit(ds, reason)
+                return True
+            return False
+        if status == "failed":
+            reason = ds.exit_order_reason
+            print(self.logic_name, f": ({ds.direction}) Exit order {ds.exit_order_id} ended "
+                  f"without completing ({getattr(order_info, 'status', 'unknown')}); "
+                  f"{ds.order_quantity} remain")
+            self.__clear_exit_order(ds)
+            if reason and reason != "Target":
+                self.__request_market_exit(ds, reason)
+                return True
+            return False
+        if status == "unknown":
+            if status != ds.exit_order_last_status:
+                print(self.logic_name, f": ({ds.direction}) Exit order status unknown "
+                      f"({getattr(order_info, 'status', 'unknown')}); retaining order tracking")
+                ds.exit_order_last_status = status
+        return True
+
+    def __request_market_exit(self, ds: _DirectionState, reason):
+        if ds.order_quantity <= 0:
+            return True
+        if ds.exit_order_id:
+            if ds.exit_order_is_market:
+                return True
+            broker = self.trade_utility.get_broker_utility()
+            order_id = ds.exit_order_id
+            try:
+                order_info = broker.getOrderInfoByOrderId(order_id)
+            except Exception:
+                print(self.logic_name, f": ({ds.direction}) Cannot confirm target order {order_id} "
+                      "before modifying it; will retry")
+                traceback.print_exc()
+                return False
+            status = self.__normalized_order_status(order_info)
+            self.__apply_exit_order_fill(ds, order_info, complete=status == "complete")
+            if status == "complete":
+                if ds.order_quantity == 0:
+                    self.__record_exit_order_fill(ds, order_info)
+                    return True
+                self.__clear_exit_order(ds)
+                if ds.order_quantity <= 0:
+                    return True
+                return self.__request_market_exit(ds, reason)
+            if status == "failed":
+                self.__clear_exit_order(ds)
+                return self.__request_market_exit(ds, reason)
+            if status != "open":
+                print(self.logic_name, f": ({ds.direction}) Cannot modify exit order {order_id}: "
+                      f"unrecognized status {getattr(order_info, 'status', 'unknown')}")
+                return False
+            try:
+                modified_id = broker.modify_order(
+                    order_id=order_id, order_type="MARKET", price=0, trigger_price=0)
+            except Exception:
+                self.__log_exit_order_modification(ds, order_id, reason, False)
+                print(self.logic_name, f": ({ds.direction}) Failed modifying target order "
+                      f"{order_id} to MARKET; will retry")
+                traceback.print_exc()
+                return False
+            self.__log_exit_order_modification(ds, order_id, reason, bool(modified_id))
+            if not modified_id:
+                print(self.logic_name, f": ({ds.direction}) Broker rejected modification of target "
+                      f"order {order_id} to MARKET; will retry")
+                return False
+            ds.exit_order_is_market = True
+            ds.exit_order_reason = reason
+            ds.exit_order_last_status = "PLACED"
+            print(self.logic_name, f": ({ds.direction}) exit order {order_id} modified to MARKET "
+                  f"because {reason}")
+            return True
+
+        placed, order_id = self.__place_real_order(
+            ds.option_symbol, "SELL", ds.order_quantity,
+            ds.current_trade.sl_hit.option_price if reason == "SL"
+            else ds.current_trade.exit5_eod.option_price,
+            reason, order_type="MARKET", return_order_id=True)
+        if placed:
+            ds.exit_order_id = order_id
+            ds.exit_order_is_market = True
+            ds.exit_order_reason = reason
+            ds.exit_order_last_status = "PLACED"
+            ds.exit_order_filled_quantity = 0
+            ds.exit_order_quantity = ds.order_quantity
+        return placed
+
     def __check_exit_hits_live(self, ds: _DirectionState):
         if self.test_mode:
             self.__check_exit_hits_test(ds)
+            return
+        self.__check_pending_exit_order(ds)
+        if ds.state != STATE_IN_TRADE:
             return
         option_ltp = self.__ltp(ds.option_symbol)
         if option_ltp is None:
@@ -590,6 +883,9 @@ class VwapPiercingEngine(ILogic):
         if pattern_rules.is_force_exit_time_reached(now_str):
             self.__finalize_trade_at_eod_live(ds, "Force Exit 14:50")
             return
+
+        if not ds.exit_order_id and ds.order_quantity > 0 and not ds.current_trade.sl_hit.is_hit:
+            self.__place_target_exit_order(ds)
 
         was_hit = self.__snapshot_exit_hits(ds.current_trade)
 
@@ -615,12 +911,10 @@ class VwapPiercingEngine(ILogic):
              f"Exit1={ds.exit1_level:.2f} Exit2={ds.exit2_level:.2f} Exit3={ds.exit3_level:.2f} "
              f"(option-price based)")
 
-        # SL is the one real exit here. Once it fires, the position is closed for real, so log
-        # the trade now and go back to scanning for the next Piercing setup -- not capped at
-        # one trade per day.
+        # A stop hit converts the resting target order to MARKET; the position remains tracked
+        # until the broker confirms the exit fill.
         if ds.current_trade.sl_hit.is_hit:
-            self.__stamp_mae_mfe(ds)
-            self.__finalize_and_reset_live(ds, "SL")
+            self.__request_market_exit(ds, "SL")
 
     def __mark_exit_if_hit_point(self, exit_hit_obj: exit_hit, level, option_ltp, now_str,
                                  is_stop=False, record_target_price=False):
@@ -683,12 +977,21 @@ class VwapPiercingEngine(ILogic):
 
     def __finalize_and_reset_live(self, ds: _DirectionState, reason="EOD"):
         print(self.logic_name, f": FINALIZING LIVE TRADE reason={reason} direction={ds.direction} option={ds.option_symbol} entry={ds.current_trade.entry_trigger_price} ts={ds.current_trade.entry_timestamp}")
-        close_option_price = ds.current_trade.sl_hit.option_price if reason == "SL" \
-            else ds.current_trade.exit5_eod.option_price
+        if ds.order_quantity and not ds.exit_order_filled and not self.test_mode:
+            self.__request_market_exit(ds, reason)
+            print(self.logic_name, f": ({ds.direction}) Waiting for MARKET exit order fill; "
+                  f"order_id={ds.exit_order_id or 'not accepted'} quantity={ds.order_quantity}")
+            return
+        if reason == "SL":
+            close_option_price = ds.current_trade.sl_hit.option_price
+        elif reason == "Target":
+            _, (_, target_hit) = self.__configured_target_exit(ds)
+            close_option_price = target_hit.option_price
+        else:
+            close_option_price = ds.current_trade.exit5_eod.option_price
 
-        # PaperTradeData logs the strategy's signal regardless of what the broker did with the real
-        # orders (OrderLog has that) -- write it before attempting the SELL, and only once, so a
-        # failed SELL that's retried on later exit checks neither hides nor duplicates the row.
+        # PaperTradeData records a normal LIVE trade only after the broker confirms its exit fill.
+        # Replay test mode preserves the prior behavior of writing before its immediate SELL.
         if not ds.paper_trade_logged:
             self.obj_paper_trade_writer.write_trade(ds.current_trade, self.candle_interval_minutes,
                                                     describe_exit_outcomes(ds.current_trade))
@@ -696,18 +999,11 @@ class VwapPiercingEngine(ILogic):
             print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}) @ {self.__fmt_option_price(close_option_price)}, logged to PaperTradeData:",
                  ds.current_trade.trade_type, ds.current_trade.option_name)
 
-        # Square off the real position, only if the entry BUY actually succeeded
-        # (order_quantity is 0 otherwise). Normal LIVE: a failed SELL must NOT reset the state
-        # machine -- we'd stop tracking a position we still hold -- so keep the trade open and
-        # let the next exit check retry. Test mode: ignore the failure and close the trade.
-        if ds.order_quantity:
+        # Replay test mode retains its prior immediate-order behavior. Normal LIVE waits for
+        # broker-confirmed fills above before logging the position as closed.
+        if ds.order_quantity and self.test_mode:
             if not self.__place_real_order(ds.option_symbol, "SELL", ds.order_quantity,
                                            close_option_price, reason):
-                if not self.test_mode:
-                    print(self.logic_name, f": ({ds.direction}) REAL EXIT ORDER FAILED for {ds.option_symbol} "
-                          f"({reason}) -- POSITION STILL OPEN, not resetting; will retry on the next exit check "
-                          f"(square off manually if the engine is stopping)")
-                    return
                 print(self.logic_name, f": ({ds.direction}) REAL EXIT ORDER FAILED for {ds.option_symbol} "
                       f"({reason}) -- TEST MODE: ignoring and closing the trade (square off manually if "
                       f"a real position was opened)")
@@ -718,6 +1014,13 @@ class VwapPiercingEngine(ILogic):
         ds.paper_trade_logged = False
         ds.piercing_candle = None
         ds.reclaim_candle = None
+        ds.entry_order_id = ""
+        ds.entry_order_symbol = ""
+        ds.entry_order_required = False
+        ds.entry_order_limit_price = 0.0
+        ds.entry_order_last_status = ""
+        self.__clear_exit_order(ds)
+        ds.exit_order_filled = False
         ds.last_logged_candle_ts = None
         # if the piercing window is already closed (past 14:30 or before start+15min at EOD),
         # this just idles in SEEK_PIERCING harmlessly -- __check_seek_piercing gates on the window.
@@ -737,15 +1040,17 @@ class VwapPiercingEngine(ILogic):
         tick = float(self.order_cfg["tick_size"])
         return round(round(price / tick) * tick, 2)
 
-    def __place_real_order(self, symbol, transaction_type, quantity, reference_price, reason):
+    def __place_real_order(self, symbol, transaction_type, quantity, reference_price, reason,
+                           order_type=None, trigger_price=0.0, price_override=None,
+                           return_order_id=False):
         """
-        LIVE only: sends a real order through the broker utility (callers check
-        self.place_orders / ds.order_quantity first). Returns True if the broker returned an
-        order id. place_order already retries internally and returns "" on failure; the
-        catch-all here is so a bad symbol/permission error can never crash the engine mid-trade.
+        LIVE only: sends a real order through the broker utility. Normally returns whether the
+        broker returned an order id; asynchronous entry/exit callers can request the id as well.
         """
-        order_type = self.order_cfg["order_type"]
-        price = self.__limit_price(transaction_type, reference_price) if order_type == "LIMIT" else 0
+        order_type = order_type or self.order_cfg["order_type"]
+        price = price_override
+        if price is None:
+            price = self.__limit_price(transaction_type, reference_price) if order_type == "LIMIT" else 0
         if self.order_cfg["order_route"] == "webhook":
             # FYERS Automate webhook: Fyers' own servers place the order (see webhook_order.py)
             _, order_id = send_webhook_order(self.order_cfg["webhook_url"], self.order_cfg["webhook_payload"], {
@@ -757,6 +1062,7 @@ class VwapPiercingEngine(ILogic):
                 "order_type": order_type,
                 "product": self.order_cfg["product_type"],
                 "price": price,
+                "trigger_price": trigger_price,
                 "reference_price": reference_price,
                 "option_type": self.option_type,
                 "reason": reason,
@@ -771,6 +1077,7 @@ class VwapPiercingEngine(ILogic):
                     product=self.order_cfg["product_type"],
                     order_type=order_type,
                     price=price,
+                    trigger_price=trigger_price,
                     exchange=self.order_cfg["exchange"],
                     market_type=self.__option_market_type(),
                 )
@@ -779,8 +1086,10 @@ class VwapPiercingEngine(ILogic):
                 traceback.print_exc()
                 order_id = ""
         success = bool(order_id)
+        trigger_note = f" trigger={trigger_price}" if trigger_price else ""
         print(self.logic_name, f": REAL ORDER {'PLACED' if success else 'FAILED'} via {self.order_cfg['order_route']} -- {transaction_type} "
-              f"{quantity} x {symbol} {order_type}{f' @ {price}' if price else ''} ({reason}, ref={reference_price})",
+              f"{quantity} x {symbol} {order_type}{f' @ {price}' if price else ''}{trigger_note} "
+              f"({reason}, ref={reference_price})",
               f"order_id={order_id!r}" if success else "")
         # one OrderLog row per attempt, success or failure -- a stuck exit shows up as repeated
         # FAILED rows until one goes through. Wall-clock time: this is when the real order was sent.
@@ -800,7 +1109,7 @@ class VwapPiercingEngine(ILogic):
             reason=f"{reason} (test mode {self.session_date_str})" if self.test_mode else reason,
             reference_price=reference_price,
         ))
-        return success
+        return (success, order_id) if return_order_id else success
 
     def __select_option_by_premium(self, broker, option_type):
         # Fyers' real getOptionChain() returns strike/type/live-premium for every contract around
@@ -810,6 +1119,58 @@ class VwapPiercingEngine(ILogic):
         chain_df, _, _ = broker.getOptionChain(underlying)
         symbol, price = select_cheapest_in_band(chain_df, option_type, self.target_premium_low, self.target_premium_high)
         return (symbol.split(":")[-1] if symbol else symbol), price
+
+    def __historical_option_bootstrap(self, option_type, ts):
+        get_contracts = getattr(self.broker, "get_option_contracts", None)
+        if not callable(get_contracts):
+            self.__log(f"[{ts}] Cannot bootstrap {option_type} test candles: broker does not list historical option contracts")
+            return None
+
+        trade_date = datetime.strptime(self.trade_date_str, "%Y-%m-%d")
+        weekly_expiry = generate_weekly_expiry_dates(trade_date, 1)[0]
+        try:
+            contracts = get_contracts(self.index_name, weekly_expiry, option_type)
+        except Exception as error:
+            self.__log(f"[{ts}] Failed listing {option_type} contracts for bootstrap: "
+                       f"{type(error).__name__}: {error}")
+            traceback.print_exc()
+            return None
+        if not contracts:
+            self.__log(f"[{ts}] No listed {option_type} contracts for bootstrap expiry {weekly_expiry}")
+            return None
+
+        center = None
+        historical_center = getattr(self.broker, "get_historical_option_center", None)
+        if callable(historical_center):
+            try:
+                center = historical_center(self.index_name, weekly_expiry, ts)
+            except Exception as error:
+                self.__log(f"[{ts}] Historical option-center lookup failed: "
+                           f"{type(error).__name__}: {error}")
+                traceback.print_exc()
+
+        if center is None:
+            center = _LAST_SELECTED_STRIKE.get((self.index_name, option_type))
+        if center is None:
+            try:
+                underlying = CHAIN_UNDERLYING_SYMBOL.get(self.index_name, self.index_name)
+                chain_df, _, _ = self.broker.getOptionChain(underlying)
+                symbol, _ = select_cheapest_in_band(
+                    chain_df, option_type, self.target_premium_low, self.target_premium_high)
+                if symbol and "strike_price" in chain_df.columns:
+                    bare = str(symbol).split(":")[-1]
+                    row = chain_df[chain_df["symbol"].astype(str).str.split(":").str[-1] == bare]
+                    if len(row):
+                        center = float(row.iloc[0]["strike_price"])
+            except Exception as error:
+                self.__log(f"[{ts}] Current option chain could not seed bootstrap strike: "
+                           f"{type(error).__name__}: {error}")
+                traceback.print_exc()
+
+        if center is None:
+            center = contracts[len(contracts) // 2]["strike_price"]
+        selected = min(contracts, key=lambda contract: abs(contract["strike_price"] - center))
+        return selected["symbol"]
 
     def __select_historical_option(self, option_type, ts):
         """
@@ -1168,13 +1529,24 @@ class VwapPiercingEngine(ILogic):
         # BACKTEST counterpart of __refresh_signal_option_live: re-pick the cheapest in-band
         # option as of ts; on a miss (or no candles for the new pick) the current one is kept.
         symbol, price = self.__select_historical_option(self.option_type, ts)
-        if not symbol or symbol == self.signal_option_symbol:
+        if not symbol:
+            if self.test_mode:
+                self.test_option_selection_ready = False
+            return
+        if symbol == self.signal_option_symbol:
+            if self.test_mode:
+                self.test_option_selection_ready = True
             return
         if self.__activate_backtest_series(symbol) is None:
             self.__activate_backtest_series(self.signal_option_symbol)
+            if self.test_mode:
+                self.test_option_selection_ready = False
             return
         self.__log(f"[{ts}] signal option changed {self.signal_option_symbol} -> {symbol} @ {price}")
         self.signal_option_symbol = symbol
+        if self.test_mode:
+            self.preselected_options[self.option_type] = (symbol, price)
+            self.test_option_selection_ready = True
 
     def __activate_backtest_series(self, symbol):
         """
@@ -1302,6 +1674,11 @@ class VwapPiercingEngine(ILogic):
             if outcome == "FORCE":
                 self.__log(f"[{bar_ts}] ({ds.direction}) force-exit (14:50 cutoff) "
                           f"({self.__fmt_option_price(trade.exit5_eod.option_price)}) -- trade closed, resuming scan")
+            elif outcome == "TARGET":
+                target_name, (_, target_hit) = self.__configured_target_exit(ds)
+                self.__log(f"[{bar_ts}] ({ds.direction}) {target_name} target filled @ "
+                           f"{self.__fmt_option_price(target_hit.option_price)} "
+                           "-- trade closed, resuming scan")
             else:
                 self.__log(f"[{bar_ts}] ({ds.direction}) SL hit @ {ds.sl_level} "
                           f"({self.__fmt_option_price(trade.sl_hit.option_price)}) -- trade closed, resuming scan")
@@ -1320,6 +1697,11 @@ class VwapPiercingEngine(ILogic):
         ds.option_symbol = ""
         ds.piercing_candle = None
         ds.reclaim_candle = None
+        ds.entry_order_id = ""
+        ds.entry_order_symbol = ""
+        ds.entry_order_required = False
+        ds.entry_order_limit_price = 0.0
+        ds.entry_order_last_status = ""
         ds.state = STATE_SEEK_PIERCING
 
     def __log(self, message):
@@ -1336,15 +1718,25 @@ class VwapPiercingEngine(ILogic):
         """
         if not pattern_rules.is_setup_abandon_time_reached(pattern_rules.time_of_day(ts)):
             return False
+        if ds.entry_order_id and not self.__cancel_pending_entry_order(ds):
+            return False
         msg = f"[{ts}] ({ds.direction}) giving up on incomplete setup (still {ds.state}) at cutoff -- resetting to seek piercing"
         if self.mode == Mode.LIVE:
             print(self.logic_name, ":", msg)
         else:
             self.__log(msg)
+        self.__reset_incomplete_setup(ds)
+        return True
+
+    def __reset_incomplete_setup(self, ds: _DirectionState):
         ds.state = STATE_SEEK_PIERCING
         ds.piercing_candle = None
         ds.reclaim_candle = None
-        return True
+        ds.entry_order_id = ""
+        ds.entry_order_symbol = ""
+        ds.entry_order_required = False
+        ds.entry_order_limit_price = 0.0
+        ds.entry_order_last_status = ""
 
     def __check_seek_piercing(self, ds: _DirectionState, row, ts):
         window_open = pattern_rules.is_piercing_window_open(pattern_rules.time_of_day(ts), self.piercing_start_time)
@@ -1401,38 +1793,252 @@ class VwapPiercingEngine(ILogic):
         msg = f"[{ts}] ({ds.direction}) RECLAIM {self.__fmt_candle(row, vwap)}"
         if self.mode == Mode.LIVE:
             print(self.logic_name, ":", msg)
+            if not self.test_mode and self.place_orders:
+                if self.order_cfg["order_route"] == "webhook":
+                    print(self.logic_name, ": Stop-limit entry requires the broker API route so order fills "
+                          "can be tracked; no entry order was sent")
+                    self.__reset_incomplete_setup(ds)
+                    return True
+                self.__place_entry_stop_order(ds)
         else:
             self.__log(msg)
         return True
 
-    def __enter_trade(self, ds: _DirectionState, entry_trigger_price, ts, main_row=None):
+    def __entry_stop_limit_price(self, trigger_price):
+        offset = float(self.order_cfg["entry_stop_limit_offset"])
+        if not math.isfinite(offset) or offset < 0:
+            raise ValueError("entry_stop_limit_offset must be non-negative")
+        return self.__round_up_to_tick(trigger_price + offset)
+
+    def __place_entry_stop_order(self, ds: _DirectionState):
+        symbol = self.signal_option_symbol or self.preselected_options.get(
+            self.option_type, (None, 0.0))[0]
+        if not symbol:
+            print(self.logic_name, f": ({ds.direction}) Cannot place reclaim stop-entry: no option selected")
+            self.__reset_incomplete_setup(ds)
+            return
+
+        trigger_price = float(ds.piercing_candle[HIGH_PRICE])
+        limit_price = self.__entry_stop_limit_price(trigger_price)
+        ds.entry_order_required = True
+        ds.entry_order_symbol = symbol
+        ds.entry_order_limit_price = limit_price
+        placed, order_id = self.__place_real_order(
+            symbol, "BUY", self.__order_quantity(), trigger_price, "Reclaim stop-entry",
+            order_type="SL", trigger_price=trigger_price, price_override=limit_price,
+            return_order_id=True)
+        if not placed:
+            print(self.logic_name, f": ({ds.direction}) Reclaim stop-entry failed; setup reset")
+            self.__reset_incomplete_setup(ds)
+            return
+        ds.entry_order_id = order_id
+        ds.entry_order_last_status = "PLACED"
+        print(self.logic_name, f": ({ds.direction}) stop-limit entry submitted after reclaim: "
+              f"trigger={trigger_price} limit={limit_price} order_id={order_id}")
+
+    @staticmethod
+    def __normalized_order_status(order_info):
+        status = str(getattr(order_info, "status", "")).strip().lower().replace("_", " ")
+        if status in {"complete", "completed", "traded", "filled"}:
+            return "complete"
+        if status in {"open", "pending", "trigger pending", "partially filled", "partial"}:
+            return "open"
+        if status in {"not traded", "cancelled", "canceled", "rejected", "expired", "failed"}:
+            return "failed"
+        return "unknown"
+
+    def __entry_order_fill_values(self, order_info, ds):
+        quantity = int(getattr(order_info, "filled_quantity", 0) or 0)
+        if quantity <= 0:
+            quantity = self.__order_quantity()
+        price = float(getattr(order_info, "average_price", 0.0) or 0.0)
+        if price <= 0:
+            price = float(getattr(order_info, "price", 0.0) or ds.entry_order_limit_price)
+        return quantity, price
+
+    def __open_filled_entry_order(self, ds: _DirectionState, order_info, ts):
+        quantity, fill_price = self.__entry_order_fill_values(order_info, ds)
+        symbol = ds.entry_order_symbol
+        ds.entry_order_id = ""
+        ds.entry_order_symbol = ""
+        ds.entry_order_required = False
+        ds.entry_order_limit_price = 0.0
+        ds.entry_order_last_status = ""
+        self.__enter_trade(ds, fill_price, ts, entry_order_already_placed=True,
+                           filled_quantity=quantity, entry_order_symbol=symbol)
+
+    def __check_pending_entry_order(self, ds: _DirectionState):
+        if not ds.entry_order_id:
+            return
+        broker = self.trade_utility.get_broker_utility()
+        ts = self.__now().strftime("%H:%M:%S")
+        try:
+            order_info = broker.getOrderInfoByOrderId(ds.entry_order_id)
+        except Exception:
+            print(self.logic_name, f": ({ds.direction}) Failed checking stop-entry order "
+                  f"{ds.entry_order_id}; will retry")
+            traceback.print_exc()
+            return
+
+        status = self.__normalized_order_status(order_info)
+        filled_quantity = int(getattr(order_info, "filled_quantity", 0) or 0)
+        if status == "complete":
+            self.__open_filled_entry_order(ds, order_info, ts)
+            return
+
+        if status == "open" and filled_quantity > 0:
+            try:
+                cancel_result = broker.cancel_order(ds.entry_order_id)
+            except Exception:
+                print(self.logic_name, f": ({ds.direction}) Partial stop-entry fill detected, but cancelling "
+                      f"the remaining quantity failed for {ds.entry_order_id}; will retry")
+                traceback.print_exc()
+                return
+            cancel_ok = (cancel_result.get("stat") == "Ok" or cancel_result.get("s") == "ok") \
+                if isinstance(cancel_result, dict) else bool(cancel_result)
+            if not cancel_ok:
+                print(self.logic_name, f": ({ds.direction}) Partial stop-entry fill detected, but the "
+                      f"remaining quantity could not be cancelled for {ds.entry_order_id}; will retry")
+                return
+            try:
+                order_info = broker.getOrderInfoByOrderId(ds.entry_order_id)
+            except Exception:
+                print(self.logic_name, f": ({ds.direction}) Stop-entry cancelled after a partial fill, "
+                      "but its final fill could not be checked; will retry")
+                traceback.print_exc()
+                return
+            final_filled_quantity = max(
+                filled_quantity, int(getattr(order_info, "filled_quantity", 0) or 0))
+            final_status = self.__normalized_order_status(order_info)
+            if final_status == "complete" or (final_status == "failed" and final_filled_quantity > 0):
+                self.__open_filled_entry_order(ds, order_info, ts)
+            elif final_status == "failed":
+                print(self.logic_name, f": ({ds.direction}) Stop-entry order cancelled without a fill")
+                self.__reset_incomplete_setup(ds)
+            else:
+                print(self.logic_name, f": ({ds.direction}) Stop-entry cancellation is not confirmed for "
+                      f"{ds.entry_order_id}; retaining the order state")
+            return
+
+        if status == "failed" and filled_quantity > 0:
+            self.__open_filled_entry_order(ds, order_info, ts)
+            return
+        if status == "open":
+            if status != ds.entry_order_last_status:
+                print(self.logic_name, f": ({ds.direction}) stop-entry order remains open "
+                      f"(order_id={ds.entry_order_id})")
+                ds.entry_order_last_status = status
+            return
+        if status == "failed":
+            print(self.logic_name, f": ({ds.direction}) stop-entry order {ds.entry_order_id} "
+                  f"was not filled ({getattr(order_info, 'status', 'unknown')}); setup reset")
+            self.__reset_incomplete_setup(ds)
+            return
+
+        if status != ds.entry_order_last_status:
+            print(self.logic_name, f": ({ds.direction}) stop-entry order status is unknown "
+                  f"({getattr(order_info, 'status', 'unknown')}); retaining setup")
+            ds.entry_order_last_status = status
+
+    def __cancel_pending_entry_order(self, ds: _DirectionState):
+        if not ds.entry_order_id:
+            return True
+        broker = self.trade_utility.get_broker_utility()
+        order_id = ds.entry_order_id
+        try:
+            order_info = broker.getOrderInfoByOrderId(order_id)
+        except Exception:
+            print(self.logic_name, f": ({ds.direction}) Cannot check stop-entry order {order_id}; "
+                  "setup remains active")
+            traceback.print_exc()
+            return False
+
+        status = self.__normalized_order_status(order_info)
+        filled_quantity = int(getattr(order_info, "filled_quantity", 0) or 0)
+        if status == "complete":
+            self.__open_filled_entry_order(ds, order_info, self.__now().strftime("%H:%M:%S"))
+            return False
+        if status == "open":
+            try:
+                cancel_result = broker.cancel_order(order_id)
+            except Exception:
+                print(self.logic_name, f": ({ds.direction}) Cannot cancel stop-entry order {order_id}; "
+                      "setup remains active")
+                traceback.print_exc()
+                return False
+            cancel_ok = (cancel_result.get("stat") == "Ok" or cancel_result.get("s") == "ok") \
+                if isinstance(cancel_result, dict) else bool(cancel_result)
+            if not cancel_ok:
+                print(self.logic_name, f": ({ds.direction}) Stop-entry order cancellation failed for "
+                      f"{order_id}; setup remains active")
+                return False
+            try:
+                order_info = broker.getOrderInfoByOrderId(order_id)
+            except Exception:
+                print(self.logic_name, f": ({ds.direction}) Stop-entry cancelled but final fill status "
+                      f"could not be read for {order_id}; setup remains active")
+                traceback.print_exc()
+                return False
+            filled_quantity = max(
+                filled_quantity, int(getattr(order_info, "filled_quantity", 0) or 0))
+            final_status = self.__normalized_order_status(order_info)
+            if final_status == "complete" or (final_status == "failed" and filled_quantity > 0):
+                self.__open_filled_entry_order(ds, order_info, self.__now().strftime("%H:%M:%S"))
+                return False
+            if final_status != "failed":
+                print(self.logic_name, f": ({ds.direction}) Stop-entry cancellation is not confirmed for "
+                      f"{order_id}; setup remains active")
+                return False
+            print(self.logic_name, f": ({ds.direction}) pending stop-entry order cancelled at setup cutoff")
+        elif status == "unknown":
+            print(self.logic_name, f": ({ds.direction}) Cannot cancel stop-entry order {order_id}: "
+                  f"unrecognized status {getattr(order_info, 'status', 'unknown')}")
+            return False
+        elif filled_quantity > 0:
+            self.__open_filled_entry_order(ds, order_info, self.__now().strftime("%H:%M:%S"))
+            return False
+
+        ds.entry_order_id = ""
+        ds.entry_order_symbol = ""
+        ds.entry_order_required = False
+        ds.entry_order_limit_price = 0.0
+        ds.entry_order_last_status = ""
+        return True
+
+    def __enter_trade(self, ds: _DirectionState, entry_trigger_price, ts, main_row=None,
+                      entry_order_already_placed=False, filled_quantity=0, entry_order_symbol=""):
         option_symbol, option_price = "", 0.0
         option_type = self.option_type
         if self.mode == Mode.LIVE:
-            broker = self.trade_utility.get_broker_utility()
-            # Prefer preselected cheapest option from pre_requisite stage; fall back to on-demand selection
-            pre_sym, pre_price = self.preselected_options.get(option_type, (None, 0.0))
-            if pre_sym:
-                option_symbol, option_price = pre_sym, pre_price
+            if entry_order_already_placed:
+                option_symbol, option_price = entry_order_symbol, entry_trigger_price
             else:
-                option_symbol, option_price = self.__select_option_by_premium(broker, option_type)
+                broker = self.trade_utility.get_broker_utility()
+                # Prefer preselected cheapest option from pre_requisite stage; fall back to on-demand selection
+                pre_sym, pre_price = self.preselected_options.get(option_type, (None, 0.0))
+                if pre_sym:
+                    option_symbol, option_price = pre_sym, pre_price
+                else:
+                    option_symbol, option_price = self.__select_option_by_premium(broker, option_type)
             if option_symbol is None:
                 print(self.logic_name, f": ({ds.direction}) No option found near target premium band; dropping setup")
                 ds.state = STATE_SEEK_PIERCING
                 ds.piercing_candle = None
                 ds.reclaim_candle = None
                 return
-            if self.test_mode:
+            if not entry_order_already_placed and self.test_mode:
                 # the traded option is the signal option, so the entry fill is its price
                 option_price = entry_trigger_price
-            else:
+            elif not entry_order_already_placed:
                 current_price = self.__ltp(option_symbol)
                 if current_price is not None:
                     option_price = current_price
             # The paper trade goes ahead regardless of the real order -- PaperTradeData logs the
             # strategy's signals, OrderLog logs what the broker did. Only a successful BUY sets
             # order_quantity, so only a real position gets a SELL on exit.
-            if self.place_orders:
+            if entry_order_already_placed:
+                ds.order_quantity = filled_quantity
+            elif self.place_orders:
                 if self.__place_real_order(option_symbol, "BUY", self.__order_quantity(),
                                            option_price, "Entry"):
                     ds.order_quantity = self.__order_quantity()
@@ -1505,6 +2111,9 @@ class VwapPiercingEngine(ILogic):
         ds.state = STATE_IN_TRADE
 
         if self.mode == Mode.LIVE:
+            ds.exit_order_filled = False
+            if not self.test_mode and ds.order_quantity > 0:
+                self.__place_target_exit_order(ds)
             if not self.test_mode:
                 self.quotes_utility.add_stocks([option_symbol], [self.__option_market_type()])
             # reset the once-per-candle throttle on entry so the first in-trade status line isn't
@@ -1626,21 +2235,38 @@ class VwapPiercingEngine(ILogic):
 
     def __in_trade_minute(self, ds: _DirectionState, bar):
         """
-        One 1-min candle of an open trade, identical in BACKTEST and LIVE test mode: MAE/MFE over
-        its High/Low, the 14:50 force-exit, then SL and exits on its Close (Exit-3 on its High).
-        Returns "FORCE" or "SL" if the trade closed on this candle, else None -- recording the
-        closed trade (results list vs sheet) is up to the caller.
+        Simulate one minute of an open trade for BACKTEST and LIVE test mode. Resting targets use
+        the candle High; the SL uses the candle Low and has priority if both levels are touched
+        in one minute. OHLC cannot reveal their intraminute order, so SL-first is conservative.
+        Returns "FORCE", "TARGET", or "SL" if the trade closed on this candle, else None.
         """
         trade = ds.current_trade
         ts = str(bar[DATE_TIME])
+        open_price = float(bar[OPEN_PRICE])
         close, high, low = float(bar[CLOSE_PRICE]), float(bar[HIGH_PRICE]), float(bar[LOW_PRICE])
         self.__update_mae_mfe_range(ds, high, low, ts)
         if pattern_rules.is_force_exit_time_reached(pattern_rules.time_of_day(ts)):
             trade.exit5_eod.option_price = close
             trade.exit5_eod.timestamp = ts
             return "FORCE"
+
+        # A stop-market exit is approximated at the stop level, or at the worse opening price
+        # when the minute gaps through the stop. If both stop and target occur in this bar, do not
+        # credit the target: historical OHLC has no evidence it happened first.
+        if ds.sl_level > 0 and low <= ds.sl_level:
+            trade.sl_hit.option_price = min(open_price, ds.sl_level)
+            trade.sl_hit.timestamp = ts
+            trade.sl_hit.is_hit = True
+            return "SL"
+
+        _, (target_level, target_hit) = self.__configured_target_exit(ds)
+        if target_level > 0 and high >= target_level:
+            target_hit.option_price = max(open_price, target_level)
+            target_hit.timestamp = ts
+            target_hit.is_hit = True
+            return "TARGET"
+
         was_hit = self.__snapshot_exit_hits(trade)
-        self.__mark_exit_if_hit_point(trade.sl_hit, ds.sl_level, close, ts, is_stop=True)
         self.__mark_exit_if_hit_point(trade.exit1_hit, ds.exit1_level, close, ts)
         self.__mark_exit_if_hit_point(trade.exit2_hit, ds.exit2_level, close, ts)
         self.__mark_exit3_if_hit_point(ds, max(close, high), ts)
@@ -1684,7 +2310,12 @@ class VwapPiercingEngine(ILogic):
                                        f"Exit3={ds.exit3_level:.2f} (option-price based)")
         if outcome is not None:
             self.__stamp_mae_mfe(ds)
-            self.__finalize_and_reset_live(ds, "Force Exit 14:50" if outcome == "FORCE" else "SL")
+            exit_reason = {
+                "FORCE": "Force Exit 14:50",
+                "TARGET": "Target",
+                "SL": "SL",
+            }[outcome]
+            self.__finalize_and_reset_live(ds, exit_reason)
 
     def __to_snapshot(self, row, vwap=None):
         # vwap is an explicit override for 5-min reclaim rows, which carry no VWAP of their own

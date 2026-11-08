@@ -5,8 +5,14 @@
   "_comment_place_order_in_test_mode": "LIVE test mode runs (--test_mode true --date ...) only, independent of place_order. true: send real orders for the replay's entries/exits.",
   "place_order_in_test_mode": false,
 
-  "_comment_order_type": "Order type for both the BUY (entry) and SELL (exit) orders: \"MARKET\" or \"LIMIT\".",
+  "_comment_order_type": "Order type for ordinary entry/exit orders: \"MARKET\" or \"LIMIT\". Reclaim entries use SL; configured target exits use LIMIT.",
   "order_type": "MARKET",
+
+  "_comment_entry_stop_limit_offset": "Entry stop-limit BUY limit price = piercing-candle-high trigger + this many price points.",
+  "entry_stop_limit_offset": 0.5,
+
+  "_comment_target_exit": "Resting SELL limit target after entry fills. Supported values: EXIT1, EXIT2, EXIT3, EXIT4_10, EXIT4_20, EXIT4_30, EXIT4_40.",
+  "target_exit": "EXIT1",
 
   "_comment_limit_buffer_percent": "LIMIT only: BUY price = reference price + buffer%, SELL price = reference price - buffer%, rounded to tick_size. The reference price is the option's LTP at the signal.",
   "limit_buffer_percent": 1.0,
@@ -18,7 +24,7 @@
   "lot_count": 1,
 
   "_comment_order_route": "How orders are sent. \"api\": Fyers API via the broker utility (needs the whitelisted static IP). \"webhook\": POST to the FYERS Automate webhook URL in Config/webhook_url.txt (gitignored -- anyone with that URL can trigger orders).",
-  "order_route": "",
+  "order_route": "api",
 
   "_comment_webhook_payload": "webhook only: the JSON body sent per order. MUST match the message your FYERS Automate strategy expects -- this one is a placeholder. Placeholders: {symbol}, {fyers_symbol}, {transaction_type}, {side}, {quantity}, {order_type}, {product}, {price}, {reference_price}, {option_type}, {reason}.",
   "webhook_payload": {

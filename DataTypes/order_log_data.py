@@ -18,7 +18,7 @@ class order_log_row:
     order_type: str = ""  # "Entry" / "Exit"
     transaction_type: str = ""  # "BUY" / "SELL" -- the literal broker side sent
     quantity: int = 0
-    price_type: str = ""  # "MARKET" / "LIMIT"
+    price_type: str = ""  # "MARKET" / "LIMIT" / "SL"
     limit_price: float = 0.0  # 0 for MARKET
     order_id: str = ""
     status: str = ""  # "PLACED" / "FAILED"
