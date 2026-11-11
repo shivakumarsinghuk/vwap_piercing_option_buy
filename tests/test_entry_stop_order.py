@@ -13,6 +13,7 @@ from BusinessLogic.vwap_piercing_option_buy.DataTypes.paper_trade_data import pa
 from BusinessLogic.vwap_piercing_option_buy.Logic.piercing_engine import (
     Mode,
     STATE_IN_TRADE,
+    STATE_SEEK_PIERCING,
     STATE_SEEK_CONFIRM_ENTRY,
     VwapPiercingEngine,
     _DirectionState,
@@ -47,6 +48,34 @@ class EntryStopOrderTests(unittest.TestCase):
         direction.current_trade = paper_trade_row()
         target_name, _ = engine._VwapPiercingEngine__configured_target_exit(direction)
         self.assertEqual(target_name, "EXIT1")
+
+    def test_paper_only_live_stop_loss_closes_trade_and_resets_setup(self):
+        self.engine.mode = Mode.LIVE
+        self.engine.test_mode = False
+        self.engine.place_orders = False
+        self.engine.order_cfg = {"target_exit": "EXIT1"}
+        self.engine.logic_name = "test"
+        self.engine.candle_interval_minutes = 5
+        self.engine.last_candle_data = None
+        self.engine.obj_paper_trade_writer = Mock()
+        self.engine._VwapPiercingEngine__now = Mock(return_value=datetime(2026, 11, 11, 10, 18))
+        self.engine._VwapPiercingEngine__ltp = Mock(return_value=90.0)
+        self.engine._VwapPiercingEngine__update_mae_mfe_point = Mock()
+        self.engine._VwapPiercingEngine__log_exit_breaches = Mock()
+        self.engine._VwapPiercingEngine__log_once_per_candle = Mock()
+
+        direction = _DirectionState("BUY")
+        direction.state = STATE_IN_TRADE
+        direction.current_trade = paper_trade_row()
+        direction.current_trade.entry_option_price = 100.0
+        direction.option_symbol = "NIFTY-CE"
+        direction.sl_level = 90.0
+
+        self.engine._VwapPiercingEngine__check_exit_hits_live(direction)
+
+        self.assertIsNone(direction.current_trade)
+        self.assertEqual(direction.state, STATE_SEEK_PIERCING)
+        self.engine.obj_paper_trade_writer.write_trade.assert_called_once()
 
     def test_limit_price_adds_configured_offset_to_piercing_high(self):
         price = self.engine._VwapPiercingEngine__entry_stop_limit_price(24399.9)

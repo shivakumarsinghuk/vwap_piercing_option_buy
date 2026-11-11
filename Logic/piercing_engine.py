@@ -913,10 +913,14 @@ class VwapPiercingEngine(ILogic):
              f"Exit1={ds.exit1_level:.2f} Exit2={ds.exit2_level:.2f} Exit3={ds.exit3_level:.2f} "
              f"(option-price based)")
 
-        # A stop hit converts the resting target order to MARKET; the position remains tracked
-        # until the broker confirms the exit fill.
+        # A real position remains tracked until its market exit fills. Paper-only trades have no
+        # broker position to wait on, so close the row and resume scanning immediately at SL.
         if ds.current_trade.sl_hit.is_hit:
-            self.__request_market_exit(ds, "SL")
+            if ds.order_quantity > 0:
+                self.__request_market_exit(ds, "SL")
+            else:
+                self.__stamp_mae_mfe(ds)
+                self.__finalize_and_reset_live(ds, "SL")
 
     def __mark_exit_if_hit_point(self, exit_hit_obj: exit_hit, level, option_ltp, now_str,
                                  is_stop=False, record_target_price=False):
