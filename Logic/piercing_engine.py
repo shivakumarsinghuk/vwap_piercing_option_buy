@@ -291,6 +291,8 @@ class VwapPiercingEngine(ILogic):
         self.trade_date_str = trade_date_str
         self.candle_interval_minutes = candle_interval_minutes
         self.log_fn = log_fn or (lambda msg: None)
+        self.order_cfg = load_order_config()
+        self.place_orders = False
         self.piercing_start_time = BACKTEST_PIERCING_START_TIME
         self.results = []
 

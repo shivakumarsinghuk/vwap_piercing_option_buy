@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timedelta
 from tempfile import NamedTemporaryFile
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -28,6 +28,25 @@ class EntryStopOrderTests(unittest.TestCase):
             "tick_size": 0.05,
         }
         self.engine.test_option_symbol = None
+
+    def test_backtest_engine_loads_exit_config_without_enabling_orders(self):
+        with patch(
+                "BusinessLogic.vwap_piercing_option_buy.Logic.piercing_engine.load_order_config",
+                return_value={"target_exit": "EXIT1", "place_order": True}):
+            engine = VwapPiercingEngine(
+                mode=Mode.BACKTEST,
+                broker=Mock(),
+                index_name="NIFTY",
+                trade_date_str="2026-11-11",
+                candle_interval_minutes=5,
+            )
+
+        self.assertEqual(engine.order_cfg["target_exit"], "EXIT1")
+        self.assertFalse(engine.place_orders)
+        direction = engine.directions["BUY"]
+        direction.current_trade = paper_trade_row()
+        target_name, _ = engine._VwapPiercingEngine__configured_target_exit(direction)
+        self.assertEqual(target_name, "EXIT1")
 
     def test_limit_price_adds_configured_offset_to_piercing_high(self):
         price = self.engine._VwapPiercingEngine__entry_stop_limit_price(24399.9)
