@@ -220,7 +220,8 @@ class VwapPiercingEngine(ILogic):
         # but harmless (idempotent), and fixes the actual race here at the source.
         self.quotes_utility.set_trade_utility(self.trade_utility)
         self.config_data = self.obj_ui_adapter_config.get_data()
-        self.obj_paper_trade_writer = UserInterfacePaperTrade(args.key)
+        self.log_to_gsheet = getattr(args, "log_to_gsheet", True)
+        self.obj_paper_trade_writer = UserInterfacePaperTrade(args.key) if self.log_to_gsheet else None
 
         # executor.py --test_mode true --date YYYY-MM-DD: replay that trading date instead of
         # today -- the clock starts at TEST_MODE_START_TIME on that date (see __now), and every
@@ -256,7 +257,7 @@ class VwapPiercingEngine(ILogic):
                   f"{self.__order_quantity()} qty ({self.order_cfg['lot_count']} x {self.order_cfg['lot_size']})",
                   "-- TEST MODE REPLAY" if self.test_mode else "")
             # every placed/failed order gets a row in the OrderLog sheet
-            self.obj_order_log_writer = UserInterfaceOrderLog(args.key)
+            self.obj_order_log_writer = UserInterfaceOrderLog(args.key) if self.log_to_gsheet else None
         else:
             print(self.logic_name, f": Real order placement disabled (paper trade only) -- "
                                    f"{order_switch} is {self.order_cfg[order_switch]!r} in Config/order_config.json")
@@ -702,21 +703,22 @@ class VwapPiercingEngine(ILogic):
         now = datetime.now(IST)
         reference_price = ds.current_trade.sl_hit.option_price if reason == "SL" \
             else ds.current_trade.exit5_eod.option_price
-        self.obj_order_log_writer.write_order(order_log_row(
-            timestamp=now.strftime("%H:%M:%S"),
-            date=now.strftime("%Y-%m-%d"),
-            option_name=ds.option_symbol,
-            option_type=self.option_type,
-            order_type="Exit",
-            transaction_type="SELL",
-            quantity=ds.order_quantity,
-            price_type="MARKET",
-            limit_price=0.0,
-            order_id=order_id,
-            status="PLACED" if success else "FAILED",
-            reason=f"{reason} (modify exit order to MARKET)",
-            reference_price=reference_price,
-        ))
+        if getattr(self, "log_to_gsheet", True):
+            self.obj_order_log_writer.write_order(order_log_row(
+                timestamp=now.strftime("%H:%M:%S"),
+                date=now.strftime("%Y-%m-%d"),
+                option_name=ds.option_symbol,
+                option_type=self.option_type,
+                order_type="Exit",
+                transaction_type="SELL",
+                quantity=ds.order_quantity,
+                price_type="MARKET",
+                limit_price=0.0,
+                order_id=order_id,
+                status="PLACED" if success else "FAILED",
+                reason=f"{reason} (modify exit order to MARKET)",
+                reference_price=reference_price,
+            ))
 
     def __apply_exit_order_fill(self, ds: _DirectionState, order_info, complete=False):
         filled = int(getattr(order_info, "filled_quantity", 0) or 0)
@@ -999,11 +1001,16 @@ class VwapPiercingEngine(ILogic):
         # PaperTradeData records a normal LIVE trade only after the broker confirms its exit fill.
         # Replay test mode preserves the prior behavior of writing before its immediate SELL.
         if not ds.paper_trade_logged:
-            self.obj_paper_trade_writer.write_trade(ds.current_trade, self.candle_interval_minutes,
-                                                    describe_exit_outcomes(ds.current_trade))
+            if getattr(self, "log_to_gsheet", True):
+                self.obj_paper_trade_writer.write_trade(ds.current_trade, self.candle_interval_minutes,
+                                                        describe_exit_outcomes(ds.current_trade))
             ds.paper_trade_logged = True
-            print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}) @ {self.__fmt_option_price(close_option_price)}, logged to PaperTradeData:",
-                 ds.current_trade.trade_type, ds.current_trade.option_name)
+            if getattr(self, "log_to_gsheet", True):
+                print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}) @ {self.__fmt_option_price(close_option_price)}, logged to PaperTradeData:",
+                      ds.current_trade.trade_type, ds.current_trade.option_name)
+            else:
+                print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}) @ "
+                      f"{self.__fmt_option_price(close_option_price)}; Google Sheets logging disabled")
 
         # Replay test mode retains its prior immediate-order behavior. Normal LIVE waits for
         # broker-confirmed fills above before logging the position as closed.
@@ -1100,21 +1107,22 @@ class VwapPiercingEngine(ILogic):
         # one OrderLog row per attempt, success or failure -- a stuck exit shows up as repeated
         # FAILED rows until one goes through. Wall-clock time: this is when the real order was sent.
         now = datetime.now(IST)
-        self.obj_order_log_writer.write_order(order_log_row(
-            timestamp=now.strftime("%H:%M:%S"),
-            date=now.strftime("%Y-%m-%d"),
-            option_name=symbol,
-            option_type=self.option_type,
-            order_type="Entry" if transaction_type == "BUY" else "Exit",
-            transaction_type=transaction_type,
-            quantity=quantity,
-            price_type=order_type,
-            limit_price=price,
-            order_id=order_id,
-            status="PLACED" if success else "FAILED",
-            reason=f"{reason} (test mode {self.session_date_str})" if self.test_mode else reason,
-            reference_price=reference_price,
-        ))
+        if getattr(self, "log_to_gsheet", True):
+            self.obj_order_log_writer.write_order(order_log_row(
+                timestamp=now.strftime("%H:%M:%S"),
+                date=now.strftime("%Y-%m-%d"),
+                option_name=symbol,
+                option_type=self.option_type,
+                order_type="Entry" if transaction_type == "BUY" else "Exit",
+                transaction_type=transaction_type,
+                quantity=quantity,
+                price_type=order_type,
+                limit_price=price,
+                order_id=order_id,
+                status="PLACED" if success else "FAILED",
+                reason=f"{reason} (test mode {self.session_date_str})" if self.test_mode else reason,
+                reference_price=reference_price,
+            ))
         return (success, order_id) if return_order_id else success
 
     def __select_option_by_premium(self, broker, option_type):
