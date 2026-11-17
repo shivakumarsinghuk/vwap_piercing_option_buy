@@ -306,7 +306,7 @@ class EntryStopOrderTests(unittest.TestCase):
     def test_stop_loss_modifies_pending_target_order_to_market(self):
         broker = Mock()
         broker.getOrderInfoByOrderId.return_value = SimpleNamespace(
-            status="Open", filled_quantity=0)
+            status="OPEN PENDING", filled_quantity=0)
         broker.modify_order.return_value = "exit-123"
         self.engine.trade_utility = SimpleNamespace(get_broker_utility=lambda: broker)
         self.engine.logic_name = "test"

@@ -1855,7 +1855,7 @@ class VwapPiercingEngine(ILogic):
         status = str(getattr(order_info, "status", "")).strip().lower().replace("_", " ")
         if status in {"complete", "completed", "traded", "filled"}:
             return "complete"
-        if status in {"open", "pending", "trigger pending", "partially filled", "partial"}:
+        if status in {"open", "open pending", "pending", "trigger pending", "partially filled", "partial"}:
             return "open"
         if status in {"not traded", "cancelled", "canceled", "rejected", "expired", "failed"}:
             return "failed"
