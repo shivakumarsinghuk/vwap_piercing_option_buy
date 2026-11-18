@@ -1,6 +1,6 @@
 {
   "_comment_place_order": "Normal LIVE runs. true: BUY the traded option on entry and SELL it on exit (SL, 14:50 force exit, end of day, executor stop) through the broker utility. false: paper-trade only, no orders. Never applies to BACKTEST.",
-  "place_order": false,
+  "place_order": true,
 
   "_comment_place_order_in_test_mode": "LIVE test mode runs (--test_mode true --date ...) only, independent of place_order. true: send real orders for the replay's entries/exits.",
   "place_order_in_test_mode": false,
