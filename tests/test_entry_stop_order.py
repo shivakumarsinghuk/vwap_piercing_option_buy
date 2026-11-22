@@ -8,7 +8,8 @@ import pandas as pd
 
 from BrokerUtility.broker_platform.fyers.fyers_utility import fyers_utitlity
 from BrokerUtility.broker_platform.kite.kite_utility import kite_utitlity
-from BusinessLogic.vwap_piercing_option_buy.Config.config_loader import load_order_config
+from BusinessLogic.vwap_piercing_option_buy.Config.config_loader import (
+    is_order_placement_enabled, is_trade_day, load_order_config)
 from BusinessLogic.vwap_piercing_option_buy.DataTypes.paper_trade_data import paper_trade_row
 from BusinessLogic.vwap_piercing_option_buy.Logic.piercing_engine import (
     Mode,
@@ -123,6 +124,25 @@ class EntryStopOrderTests(unittest.TestCase):
         config = load_order_config(path="/no/such/order_config.json")
         self.assertEqual(config["entry_stop_limit_offset"], 0.5)
         self.assertEqual(config["target_exit"], "EXIT1")
+        self.assertEqual(config["trade_days"], ["All"])
+
+        with NamedTemporaryFile(mode="w", suffix=".json") as config_file:
+            config_file.write('{"trade_days": ["Monday", "Tuesday"]}')
+            config_file.flush()
+            config = load_order_config(path=config_file.name)
+        self.assertEqual(config["trade_days"], ["Monday", "Tuesday"])
+        self.assertTrue(is_trade_day("2026-11-23", config["trade_days"]))
+        self.assertTrue(is_trade_day("2026-11-24", config["trade_days"]))
+        self.assertFalse(is_trade_day("2026-11-25", config["trade_days"]))
+        order_config = {
+            "place_order": True,
+            "place_order_in_test_mode": True,
+            "trade_days": config["trade_days"],
+        }
+        self.assertTrue(is_order_placement_enabled(order_config, "2026-11-23"))
+        self.assertFalse(is_order_placement_enabled(order_config, "2026-11-25"))
+        self.assertFalse(is_order_placement_enabled(order_config, "2026-11-25", test_mode=True))
+        self.assertTrue(is_order_placement_enabled(order_config, "2026-11-24", test_mode=True))
 
         with NamedTemporaryFile(mode="w", suffix=".json") as config_file:
             config_file.write('{"entry_stop_limit_offset": -0.5}')
@@ -134,6 +154,12 @@ class EntryStopOrderTests(unittest.TestCase):
             config_file.write('{"target_exit": "BOLLINGER"}')
             config_file.flush()
             with self.assertRaisesRegex(ValueError, "target_exit must be one of"):
+                load_order_config(path=config_file.name)
+
+        with NamedTemporaryFile(mode="w", suffix=".json") as config_file:
+            config_file.write('{"trade_days": ["Funday"]}')
+            config_file.flush()
+            with self.assertRaisesRegex(ValueError, "Monday through Sunday"):
                 load_order_config(path=config_file.name)
 
     def test_stop_limit_submission_passes_trigger_and_limit_to_broker(self):
@@ -558,6 +584,7 @@ class EntryStopOrderTests(unittest.TestCase):
         from threading import Event
 
         self.engine.test_mode = True
+        self.engine.trade_day_allowed = False
         self.engine.test_option_symbol = "NIFTY26N0924550CE"
         self.engine.option_type = "CE"
         self.engine.session_date_str = "2026-11-05"

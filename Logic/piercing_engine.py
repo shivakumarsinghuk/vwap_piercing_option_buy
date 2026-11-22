@@ -48,7 +48,7 @@ from ..UserInterface.adapter.config.config import *
 from ..UserInterface.gsheet.paper_trade.paper_trade import *
 from ..UserInterface.gsheet.order_log.order_log import *
 from ..DataTypes.order_log_data import order_log_row
-from ..Config.config_loader import load_order_config
+from ..Config.config_loader import is_order_placement_enabled, is_trade_day, load_order_config
 from . import pattern_rules
 from .option_selection import select_by_premium, select_cheapest_in_band
 from .webhook_order import send_webhook_order
@@ -248,10 +248,16 @@ class VwapPiercingEngine(ILogic):
 
         # Config/order_config.json: whether entries/exits send real orders via the broker utility
         self.order_cfg = load_order_config()
+        self.trade_day_allowed = is_trade_day(
+            self.session_date_str, self.order_cfg.get("trade_days", ["All"]))
         # test mode is governed only by place_order_in_test_mode, normal LIVE only by place_order
         order_switch = "place_order_in_test_mode" if self.test_mode else "place_order"
-        self.place_orders = bool(self.order_cfg[order_switch])
-        if self.place_orders:
+        self.place_orders = is_order_placement_enabled(
+            self.order_cfg, self.session_date_str, self.test_mode)
+        if not self.trade_day_allowed:
+            print(self.logic_name, ": Real order placement disabled for",
+                  self.session_date_str, "-- weekday is not in trade_days; strategy will run paper-only")
+        elif self.place_orders:
             print(self.logic_name, ": WARNING -- REAL ORDER PLACEMENT ENABLED via", self.order_cfg["order_route"] + ":",
                   self.order_cfg["order_type"], self.order_cfg["product_type"],
                   f"{self.__order_quantity()} qty ({self.order_cfg['lot_count']} x {self.order_cfg['lot_size']})",

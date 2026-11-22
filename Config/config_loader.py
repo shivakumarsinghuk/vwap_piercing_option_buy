@@ -9,16 +9,19 @@ OFF, so a missing or partial config file can never start sending real orders by 
 import json
 import math
 import os
+from datetime import datetime
 
 _CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_ORDER_CONFIG_PATH = os.path.join(_CONFIG_DIR, "order_config.json")
 # The webhook URL lets anyone who has it trigger orders on the account, so it lives in its own
 # gitignored file instead of order_config.json.
 _WEBHOOK_URL_PATH = os.path.join(_CONFIG_DIR, "webhook_url.txt")
+WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
 ORDER_DEFAULTS = {
     "place_order": False,
     "place_order_in_test_mode": False,
+    "trade_days": ["All"],
     "order_type": "MARKET",
     "entry_stop_limit_offset": 0.5,
     "target_exit": "EXIT1",
@@ -33,6 +36,49 @@ ORDER_DEFAULTS = {
 }
 
 
+def normalize_trade_days(value):
+    if isinstance(value, str):
+        days = value.split(",")
+    elif isinstance(value, list):
+        days = value
+    else:
+        raise ValueError("trade_days must be 'All', a weekday, or a list of weekdays")
+
+    normalized_days = []
+    for day in days:
+        if not isinstance(day, str):
+            raise ValueError("trade_days entries must be weekday names or 'All'")
+        normalized = day.strip().title()
+        if normalized.lower() == "all":
+            normalized = "All"
+        elif normalized not in WEEKDAYS:
+            raise ValueError(
+                "trade_days entries must be Monday through Sunday or 'All'")
+        if normalized not in normalized_days:
+            normalized_days.append(normalized)
+
+    if not normalized_days:
+        raise ValueError("trade_days must contain at least one weekday or 'All'")
+    if "All" in normalized_days and len(normalized_days) > 1:
+        raise ValueError("'All' cannot be combined with individual trade_days")
+    return normalized_days
+
+
+def is_trade_day(trade_date, trade_days):
+    normalized_days = normalize_trade_days(trade_days)
+    if normalized_days == ["All"]:
+        return True
+    if isinstance(trade_date, str):
+        trade_date = datetime.strptime(trade_date, "%Y-%m-%d").date()
+    return trade_date.strftime("%A") in normalized_days
+
+
+def is_order_placement_enabled(order_config, trade_date, test_mode=False):
+    order_key = "place_order_in_test_mode" if test_mode else "place_order"
+    return bool(order_config.get(order_key, False)) and is_trade_day(
+        trade_date, order_config.get("trade_days", ["All"]))
+
+
 def load_order_config(path=None):
     """
     ORDER_DEFAULTS with order_config.json's values overlaid ("_comment..." keys dropped), plus
@@ -44,6 +90,7 @@ def load_order_config(path=None):
         with open(config_path) as f:
             loaded = json.load(f)
         cfg.update({k: v for k, v in loaded.items() if not k.startswith("_comment")})
+    cfg["trade_days"] = normalize_trade_days(cfg["trade_days"])
     cfg["webhook_url"] = ""
     if os.path.exists(_WEBHOOK_URL_PATH):
         with open(_WEBHOOK_URL_PATH) as f:

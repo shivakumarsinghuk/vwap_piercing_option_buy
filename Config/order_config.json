@@ -5,6 +5,9 @@
   "_comment_place_order_in_test_mode": "LIVE test mode runs (--test_mode true --date ...) only, independent of place_order. true: send real orders for the replay's entries/exits.",
   "place_order_in_test_mode": false,
 
+  "_comment_trade_days": "Allow real order placement on these weekdays. The strategy still runs and logs paper trades on other days. Use [\"All\"] for every day, [\"Monday\"] for Mondays only, or a list such as [\"Monday\", \"Tuesday\"].",
+  "trade_days": ["Monday", "Tuesday", "Wednesday", "Thursday"],
+
   "_comment_order_type": "Order type for ordinary entry/exit orders: \"MARKET\" or \"LIMIT\". Reclaim entries use SL; configured target exits use LIMIT.",
   "order_type": "MARKET",
 
